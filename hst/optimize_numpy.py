@@ -60,6 +60,8 @@ def compute_loss_and_grad_order1(
     hst,
     target_coeffs: Dict[tuple, np.ndarray],
     weights: Optional[Dict[int, float]] = None,
+    loss_type: str = 'l2',
+    phase_lambda: float = 1.0,
 ) -> Tuple[float, np.ndarray]:
     """
     Compute Order-1 loss and analytic gradient.
@@ -74,6 +76,10 @@ def compute_loss_and_grad_order1(
         Target coefficients {(j,): W_target[j]} for Order-1 paths
     weights : dict, optional
         Per-order weights {order: weight}. Default: {1: 1.0}
+    loss_type : str
+        'l2' for standard L2 loss, 'phase_robust' for circular phase distance
+    phase_lambda : float
+        Weight on phase term in phase_robust loss (default 1.0)
         
     Returns
     -------
@@ -83,7 +89,93 @@ def compute_loss_and_grad_order1(
         Gradient of loss w.r.t. x
     """
     # Delegate to Order 2 with no Order 2 targets
-    return compute_loss_and_grad_order2(x, hst, target_coeffs, weights)
+    return compute_loss_and_grad_order2(
+        x, hst, target_coeffs, weights, 
+        loss_type=loss_type, phase_lambda=phase_lambda
+    )
+
+
+def _compute_phase_robust_loss_and_grad(
+    W: np.ndarray, 
+    W_target: np.ndarray,
+    weight: float = 1.0,
+    phase_lambda: float = 1.0,
+) -> Tuple[float, np.ndarray]:
+    """
+    Compute phase-robust loss and gradient for a single coefficient array.
+    
+    Loss: L = w * (|ρ - ρ_t|² + λ * |exp(iθ) - exp(iθ_t)|²)
+    
+    where W = θ + iρ (θ = Re(W), ρ = Im(W))
+    
+    The circular distance |exp(iθ) - exp(iθ_t)|² = 2(1 - cos(θ - θ_t))
+    avoids branch cut discontinuities.
+    
+    Parameters
+    ----------
+    W : ndarray, complex
+        Coefficient array (W = R(U) = i·ln(U) = -arg(U) + i·ln|U|)
+    W_target : ndarray, complex
+        Target coefficient array
+    weight : float
+        Overall weight on this loss term
+    phase_lambda : float
+        Relative weight on phase vs magnitude
+        
+    Returns
+    -------
+    loss : float
+        Loss value
+    grad_W : ndarray, complex
+        Gradient ∂L/∂W̄ for backpropagation
+    """
+    # Decompose W = θ + iρ
+    theta = W.real       # Phase: -arg(z)
+    rho = W.imag         # Log-magnitude: ln|z|
+    theta_t = W_target.real
+    rho_t = W_target.imag
+    
+    # Magnitude loss: |ρ - ρ_t|²
+    rho_diff = rho - rho_t
+    loss_mag = np.sum(rho_diff**2)
+    
+    # Phase loss: |exp(iθ) - exp(iθ_t)|² = 2(1 - cos(θ - θ_t))
+    theta_diff = theta - theta_t
+    loss_phase = 2 * np.sum(1 - np.cos(theta_diff))
+    
+    # Total loss
+    loss = weight * (loss_mag + phase_lambda * loss_phase)
+    
+    # Gradients
+    # ∂L/∂ρ = 2(ρ - ρ_t)
+    grad_rho = 2 * weight * rho_diff
+    
+    # ∂L/∂θ = 2λ·sin(θ - θ_t)
+    grad_theta = 2 * weight * phase_lambda * np.sin(theta_diff)
+    
+    # For complex gradient: W = θ + iρ, so ∂L/∂W̄ = (1/2)(∂L/∂θ + i·∂L/∂ρ)
+    # But for our backprop we need grad that when multiplied gives the right update
+    # Since W = θ + iρ, we have: grad_W_bar = grad_theta + 1j * grad_rho
+    grad_W = grad_theta + 1j * grad_rho
+    
+    return float(loss), grad_W
+
+
+def _compute_l2_loss_and_grad(
+    W: np.ndarray,
+    W_target: np.ndarray, 
+    weight: float = 1.0,
+) -> Tuple[float, np.ndarray]:
+    """
+    Compute standard L2 loss and gradient.
+    
+    Loss: L = w * |W - W_t|²
+    Gradient: ∂L/∂W̄ = 2w(W - W_t)
+    """
+    diff = W - W_target
+    loss = weight * np.sum(np.abs(diff)**2).real
+    grad_W = 2 * weight * diff
+    return float(loss), grad_W
 
 
 def compute_loss_and_grad_order2(
@@ -91,6 +183,8 @@ def compute_loss_and_grad_order2(
     hst,
     target_coeffs: Dict[tuple, np.ndarray],
     weights: Optional[Dict[int, float]] = None,
+    loss_type: str = 'l2',
+    phase_lambda: float = 1.0,
 ) -> Tuple[float, np.ndarray]:
     """
     Compute Order-1 and Order-2 loss with analytic gradient.
@@ -112,11 +206,17 @@ def compute_loss_and_grad_order2(
         {(): S0, (j,): W1[j], (j,k): W2[j,k]}
     weights : dict, optional
         Per-order weights {order: weight}. Default: all 1.0
+    loss_type : str
+        'l2': Standard |W - W_target|² loss
+        'phase_robust': Circular phase distance + log-magnitude L2
+                        L = |ρ - ρ_t|² + λ|exp(iθ) - exp(iθ_t)|²
+    phase_lambda : float
+        Weight on phase term for phase_robust loss (default 1.0)
         
     Returns
     -------
     loss : float
-        Total L2 loss
+        Total loss
     grad_x : ndarray, shape (T,), complex
         Gradient of loss w.r.t. x
     """
@@ -171,12 +271,24 @@ def compute_loss_and_grad_order2(
             W2[path] = hst._R(U2_lifted[path])
     
     # =========================================================================
-    # COMPUTE LOSS
+    # COMPUTE LOSS (and cache gradients w.r.t. W for backward pass)
     # =========================================================================
     
     loss = 0.0
     
-    # Order 0 loss
+    # Select loss function
+    if loss_type == 'l2':
+        loss_fn = _compute_l2_loss_and_grad
+    elif loss_type == 'phase_robust':
+        loss_fn = lambda W, Wt, w: _compute_phase_robust_loss_and_grad(W, Wt, w, phase_lambda)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+    
+    # Cache gradients w.r.t W for each path (used in backward pass)
+    grad_W1_from_loss = {}
+    grad_W2_from_loss = {}
+    
+    # Order 0 loss (always L2, no R mapping applied)
     if () in target_coeffs:
         w0 = weights.get(0, 1.0)
         diff0 = S0 - target_coeffs[()]
@@ -187,15 +299,17 @@ def compute_loss_and_grad_order2(
     for j in range(hst.n_mothers):
         path = (j,)
         if path in target_coeffs:
-            diff = W1[j] - target_coeffs[path]
-            loss += w1 * np.sum(np.abs(diff)**2).real
+            l, g = loss_fn(W1[j], target_coeffs[path], w1)
+            loss += l
+            grad_W1_from_loss[j] = g
     
     # Order 2 loss
     w2 = weights.get(2, 1.0)
     for path in W2:
         if path in target_coeffs:
-            diff = W2[path] - target_coeffs[path]
-            loss += w2 * np.sum(np.abs(diff)**2).real
+            l, g = loss_fn(W2[path], target_coeffs[path], w2)
+            loss += l
+            grad_W2_from_loss[path] = g
     
     # =========================================================================
     # BACKWARD PASS
@@ -209,17 +323,14 @@ def compute_loss_and_grad_order2(
     grad_W1_accum = {j: np.zeros(T, dtype=np.complex128) for j in range(hst.n_mothers)}
     
     # --- Layer 2 Backward ---
-    w2 = weights.get(2, 1.0)
-    
     for path in W2:
-        if path not in target_coeffs:
+        if path not in grad_W2_from_loss:
             continue
         
         j, k = path
         
-        # Gradient w.r.t W2[j,k]
-        diff = W2[path] - target_coeffs[path]
-        grad_W2 = 2 * w2 * diff
+        # Gradient w.r.t W2[j,k] from loss
+        grad_W2 = grad_W2_from_loss[path]
         
         # Backward through R2: W2 = i·ln(U2)
         # dW/dU = i/U, grad_U = grad_W * conj(i/U)
@@ -239,16 +350,9 @@ def compute_loss_and_grad_order2(
         grad_W1_accum[j] += grad_W1_contrib
     
     # --- Layer 1 Backward ---
-    w1 = weights.get(1, 1.0)
-    
     for j in range(hst.n_mothers):
-        path = (j,)
-        
-        # Direct gradient from Order 1 loss
-        grad_W1_direct = np.zeros(T, dtype=np.complex128)
-        if path in target_coeffs:
-            diff = W1[j] - target_coeffs[path]
-            grad_W1_direct = 2 * w1 * diff
+        # Direct gradient from Order 1 loss (if target exists)
+        grad_W1_direct = grad_W1_from_loss.get(j, np.zeros(T, dtype=np.complex128))
         
         # Total gradient at W1[j] = direct + accumulated from Order 2
         grad_W1_total = grad_W1_direct + grad_W1_accum[j]
@@ -264,7 +368,7 @@ def compute_loss_and_grad_order2(
         grad_U1_hat = np.fft.fft(grad_U1)
         grad_x_hat += grad_U1_hat * np.conj(hst.filters[j])
     
-    # --- Order 0 Backward (no R) ---
+    # --- Order 0 Backward (no R, always L2) ---
     if () in target_coeffs:
         w0 = weights.get(0, 1.0)
         diff0 = S0 - target_coeffs[()]
@@ -286,9 +390,11 @@ def compute_loss_only(
     hst,
     target_coeffs: Dict[tuple, np.ndarray],
     weights: Optional[Dict[int, float]] = None,
+    loss_type: str = 'l2',
+    phase_lambda: float = 1.0,
 ) -> float:
     """Compute loss without gradient (for finite difference testing)."""
-    loss, _ = compute_loss_and_grad_order1(x, hst, target_coeffs, weights)
+    loss, _ = compute_loss_and_grad_order2(x, hst, target_coeffs, weights, loss_type, phase_lambda)
     return loss
 
 
@@ -298,6 +404,8 @@ def finite_difference_gradient(
     target_coeffs: Dict[tuple, np.ndarray],
     weights: Optional[Dict[int, float]] = None,
     eps: float = 1e-7,
+    loss_type: str = 'l2',
+    phase_lambda: float = 1.0,
 ) -> np.ndarray:
     """
     Compute gradient using finite differences (for testing).
@@ -314,8 +422,8 @@ def finite_difference_gradient(
         x_plus[i] += eps
         x_minus[i] -= eps
         
-        loss_plus = compute_loss_only(x_plus, hst, target_coeffs, weights)
-        loss_minus = compute_loss_only(x_minus, hst, target_coeffs, weights)
+        loss_plus = compute_loss_only(x_plus, hst, target_coeffs, weights, loss_type, phase_lambda)
+        loss_minus = compute_loss_only(x_minus, hst, target_coeffs, weights, loss_type, phase_lambda)
         
         grad[i] += (loss_plus - loss_minus) / (2 * eps)
     
@@ -326,8 +434,8 @@ def finite_difference_gradient(
         x_plus[i] += 1j * eps
         x_minus[i] -= 1j * eps
         
-        loss_plus = compute_loss_only(x_plus, hst, target_coeffs, weights)
-        loss_minus = compute_loss_only(x_minus, hst, target_coeffs, weights)
+        loss_plus = compute_loss_only(x_plus, hst, target_coeffs, weights, loss_type, phase_lambda)
+        loss_minus = compute_loss_only(x_minus, hst, target_coeffs, weights, loss_type, phase_lambda)
         
         grad[i] += 1j * (loss_plus - loss_minus) / (2 * eps)
     
@@ -344,6 +452,8 @@ def optimize_signal(
     momentum: float = 0.9,
     verbose: bool = True,
     callback: Optional[callable] = None,
+    loss_type: str = 'l2',
+    phase_lambda: float = 1.0,
 ) -> OptimizationResult:
     """
     Optimize signal to match target HST coefficients.
@@ -370,6 +480,10 @@ def optimize_signal(
         Print progress
     callback : callable, optional
         Called each step with (step, x, loss, grad)
+    loss_type : str
+        'l2' or 'phase_robust'
+    phase_lambda : float
+        Weight on phase term for phase_robust loss
         
     Returns
     -------
@@ -382,7 +496,7 @@ def optimize_signal(
     grad_norm_history = []
     
     for step in range(n_steps):
-        loss, grad = compute_loss_and_grad_order1(x, hst, target_coeffs, weights)
+        loss, grad = compute_loss_and_grad_order2(x, hst, target_coeffs, weights, loss_type, phase_lambda)
         
         grad_norm = np.linalg.norm(grad)
         loss_history.append(loss)
@@ -402,7 +516,7 @@ def optimize_signal(
         # This is handled by the lifting mechanism in the forward pass
     
     # Final loss
-    final_loss, _ = compute_loss_and_grad_order1(x, hst, target_coeffs, weights)
+    final_loss, _ = compute_loss_and_grad_order2(x, hst, target_coeffs, weights, loss_type, phase_lambda)
     loss_history.append(final_loss)
     
     if verbose:
