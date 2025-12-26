@@ -142,11 +142,22 @@ def test_winding_tracking_during_optimization():
         winding_history = result.winding_history
         analysis = detect_winding_change(winding_history)
         
+        # Count transient winding excursions (winding changed mid-optimization but returned)
+        unique_windings = set(round(w) for w in winding_history)
+        had_excursions = len(unique_windings) > 1
+        
         print(f"Final winding: {winding_history[-1]:.4f}")
-        print(f"Winding changed: {analysis['changed']}")
+        
+        # More honest messaging about winding changes
         if analysis['changed']:
-            print(f"  Change detected at step: {analysis['change_step']}")
-            print(f"  Initial → Final: {analysis['initial_winding']} → {analysis['final_winding']}")
+            print(f"Winding CHANGED (initial→final): {analysis['initial_winding']} → {analysis['final_winding']}")
+            print(f"  First change at step: {analysis['change_step']}")
+        elif had_excursions:
+            print(f"Final winding PRESERVED (initial=final={analysis['initial_winding']})")
+            print(f"  Note: Transient excursions observed (visited windings: {sorted(unique_windings)})")
+        else:
+            print(f"Winding STABLE throughout: {analysis['initial_winding']}")
+        
         print(f"Max deviation from integer: {analysis['max_deviation']:.4f}")
         
         # Check correlation with min_seg
@@ -328,44 +339,51 @@ def test_homotopy_guard():
     else:
         print(f"  ✗ Test setup issue or guard not working")
     
-    # Now test on actual optimization case
-    print(f"\nReal optimization test (k=16, l2):")
+    # Test on actual optimization cases
+    print(f"\n" + "-"*60)
+    print("Real optimization tests WITH vs WITHOUT homotopy guard:")
+    print("-"*60)
     
-    k = 16
-    T = 64 * k
-    x_target = create_winding_signal(T, k)
-    np.random.seed(42)
-    x0 = x_target + 0.02 * (np.random.randn(T) + 1j * np.random.randn(T))
+    test_cases = [
+        (16, 'l2'),
+        (16, 'phase_robust'),
+        (32, 'phase_robust'),
+    ]
     
-    hst = HeisenbergScatteringTransform(T, J=2, Q=2, max_order=1, lifting='radial_floor', epsilon=1e-8)
-    target_coeffs = extract_all_targets(hst, x_target)
+    print(f"\n{'Case':<25} {'W_init':>8} {'W_no_guard':>12} {'W_with_guard':>14} {'Protected':>10}")
+    print("-" * 75)
     
-    # Without margin
-    result_no_margin = optimize_signal(
-        target_coeffs, hst, x0.copy(), n_steps=100, lr=1e-8,
-        normalize=True, loss_type='l2', verbose=False
-    )
+    for k, loss_type in test_cases:
+        T = 64 * k
+        x_target = create_winding_signal(T, k)
+        np.random.seed(42)
+        x0 = x_target + 0.02 * (np.random.randn(T) + 1j * np.random.randn(T))
+        
+        hst = HeisenbergScatteringTransform(T, J=2, Q=2, max_order=1, lifting='radial_floor', epsilon=1e-8)
+        target_coeffs = extract_all_targets(hst, x_target)
+        
+        # Without margin
+        result_no_margin = optimize_signal(
+            target_coeffs, hst, x0.copy(), n_steps=100, lr=1e-8,
+            normalize=True, loss_type=loss_type, verbose=False
+        )
+        
+        # With homotopy-aware margin
+        result_with_margin = optimize_signal(
+            target_coeffs, hst, x0.copy(), n_steps=100, lr=1e-8,
+            normalize=True, loss_type=loss_type, topology_margin=0.05, verbose=False
+        )
+        
+        w_initial = round(result_no_margin.winding_history[0])
+        w_final_no = round(result_no_margin.winding_history[-1])
+        w_final_with = round(result_with_margin.winding_history[-1])
+        
+        protected = "✓" if w_initial == w_final_with else "✗"
+        case_name = f"k={k} {loss_type}"
+        
+        print(f"{case_name:<25} {w_initial:>8} {w_final_no:>12} {w_final_with:>14} {protected:>10}")
     
-    # With homotopy-aware margin
-    result_with_margin = optimize_signal(
-        target_coeffs, hst, x0.copy(), n_steps=100, lr=1e-8,
-        normalize=True, loss_type='l2', topology_margin=0.05, verbose=False
-    )
-    
-    w_initial = round(result_no_margin.winding_history[0])
-    w_final_no = round(result_no_margin.winding_history[-1])
-    w_final_with = round(result_with_margin.winding_history[-1])
-    
-    print(f"  Initial winding: {w_initial}")
-    print(f"  Final winding (no margin): {w_final_no}")
-    print(f"  Final winding (with homotopy guard): {w_final_with}")
-    
-    if w_initial == w_final_with and w_initial != w_final_no:
-        print(f"  ✓ Homotopy guard preserved winding!")
-    elif w_initial == w_final_with == w_final_no:
-        print(f"  ⚠ Both preserved winding (margin may not have been needed)")
-    else:
-        print(f"  ✗ Homotopy guard did not preserve winding")
+    print(f"\n  Note: 'Protected' = final winding with guard matches initial winding")
 
 
 def test_detailed_trajectory_analysis():
@@ -424,8 +442,8 @@ def test_winding_consistency():
     ChatGPT-requested diagnostic: prove consistency between winding methods.
     
     1. Compute winding two ways (diff vs atan2) and flag disagreements
-    2. Log exact min_seg at the step where winding changes
-    3. Run topology invariant check
+    2. Log exact min_seg at the step where winding changes (both endpoint and homotopy)
+    3. Run topology invariant check with proper classification
     """
     print("\n" + "="*70)
     print("TEST: WINDING CONSISTENCY (ChatGPT Diagnostic)")
@@ -436,6 +454,7 @@ def test_winding_consistency():
         compute_winding_atan2,
         check_topology_invariant,
         _compute_winding_inline,
+        min_seg_along_homotopy,
     )
     
     # Focus on the cases that showed anomalies
@@ -512,8 +531,8 @@ def test_winding_consistency():
         else:
             print(f"  ✓ All {len(all_signals)} steps agree (diff ≈ atan2)")
         
-        # 2. Find winding change points and log 5-step window
-        print("\n2. WINDING CHANGE POINTS (5-step window)")
+        # 2. Find winding change points and log 5-step window WITH HOMOTOPY CHECK
+        print("\n2. WINDING CHANGE POINTS (with homotopy analysis)")
         print("-" * 50)
         
         prev_w = round(winding_diff_history[0])
@@ -530,9 +549,26 @@ def test_winding_consistency():
         else:
             print(f"  {len(change_steps)} winding changes detected")
             
-            # Show first 3 changes with 5-step windows
+            # Show first 3 changes with 5-step windows AND homotopy analysis
             for change_idx, (step, w_before, w_after) in enumerate(change_steps[:3]):
-                print(f"\n  Change #{change_idx+1}: Step {step}, W: {w_before} → {w_after}")
+                print(f"\n  Change #{change_idx+1}: Step {step-1}→{step}, W: {w_before} → {w_after}")
+                
+                # Compute homotopy min_seg for this transition
+                if step > 0:
+                    x_old = all_signals[step-1][1]
+                    x_new = all_signals[step][1]
+                    homotopy_min, worst_s = min_seg_along_homotopy(x_old, x_new)
+                    min_seg_endpoints = min(min_seg_at_step[step-1], min_seg_at_step[step])
+                    
+                    print(f"    min_seg(endpoints): {min_seg_endpoints:.6f}")
+                    print(f"    min_seg(homotopy):  {homotopy_min:.6f} at s={worst_s:.2f}")
+                    
+                    # Classify based on homotopy, not endpoints
+                    if homotopy_min < MARGIN:
+                        print(f"    Classification: TOPOLOGICAL (tunneling through origin)")
+                    else:
+                        print(f"    Classification: ⚠ TRUE INVARIANT VIOLATION")
+                
                 print(f"  {'Step':>6} {'W_diff':>10} {'W_atan2':>10} {'min_seg':>12} {'Note':>10}")
                 print(f"  {'-'*50}")
                 
@@ -547,8 +583,8 @@ def test_winding_consistency():
                     note = "<-- CHANGE" if i == step else ""
                     print(f"  {i:>6} {wd:>10.4f} {wa:>10.4f} {ms:>12.6f} {note:>10}")
         
-        # 3. Run topology invariant check
-        print("\n3. TOPOLOGY INVARIANT CHECK")
+        # 3. Run topology invariant check (endpoint-based, for reference)
+        print("\n3. TOPOLOGY INVARIANT CHECK (endpoint-based)")
         print("-" * 50)
         
         invariant_result = check_topology_invariant(
@@ -558,20 +594,19 @@ def test_winding_consistency():
         )
         
         if invariant_result['passed']:
-            print(f"  ✓ PASSED: No violations with margin={MARGIN}")
-            print(f"    (Winding only changes when min_seg < {MARGIN})")
+            print(f"  ✓ PASSED: No endpoint-based violations with margin={MARGIN}")
         else:
-            print(f"  ✗ FAILED: {invariant_result['n_violations']} violations with margin={MARGIN}")
+            print(f"  ⚠ {invariant_result['n_violations']} endpoint-based violations")
+            print(f"    (These may be tunneling, not true bugs - check homotopy above)")
             for step, w1, w2, ms1, ms2 in invariant_result['violations'][:3]:
                 print(f"    Step {step}→{step+1}: W={w1}→{w2}, min_seg={ms1:.6f}→{ms2:.6f}")
-            print(f"    This indicates a BUG: winding changed without origin crossing!")
         
         # Summary
         print(f"\n  SUMMARY for k={k} {loss_type}:")
         print(f"    Initial winding: {round(winding_diff_history[0])}")
         print(f"    Final winding: {round(winding_diff_history[-1])}")
         print(f"    Method agreement: {'YES' if not disagreements else 'NO'}")
-        print(f"    Invariant passed: {'YES' if invariant_result['passed'] else 'NO'}")
+        print(f"    Endpoint invariant: {'PASSED' if invariant_result['passed'] else 'VIOLATIONS (check homotopy)'}")
 
 
 def main():
@@ -583,14 +618,10 @@ def main():
     # Run tests
     test_winding_precision()
     test_winding_consistency()  # ChatGPT's requested diagnostic
-    test_homotopy_guard()  # NEW: Test the homotopy-aware guard
+    test_homotopy_guard()  # Test the homotopy-aware guard
     test_winding_change_correlation()
     test_winding_with_topology_margin()
     test_detailed_trajectory_analysis()
-    
-    print("\n" + "="*70)
-    print("DIAGNOSTIC COMPLETE")
-    print("="*70)
     
     print("\n" + "="*70)
     print("DIAGNOSTIC COMPLETE")
