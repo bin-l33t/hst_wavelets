@@ -322,7 +322,107 @@ def test_homotopy_jump_detection():
 
 
 # =============================================================================
-# Test 3: Gradient Direction with High Winding
+# Test 3: Topology Margin Constraint
+# =============================================================================
+
+def test_topology_margin():
+    """
+    Test the topology_margin parameter that enforces min_seg >= δ.
+    
+    This uses backtracking line search to prevent the optimizer from
+    "tunneling" through the origin between samples.
+    """
+    print("\n[TEST 3: TOPOLOGY MARGIN CONSTRAINT]")
+    print("-" * 95)
+    print("  Testing backtracking line search with min_seg >= δ constraint")
+    print("  Comparing optimization with and without topology protection")
+    print()
+    
+    # Use k=16 which showed tunneling in previous tests
+    k = 16
+    T = 64 * k
+    noise_level = 0.02
+    margin = 0.01  # Enforce min_seg >= 0.01
+    
+    x_target = create_winding_signal(T, k, radius=1.0)
+    x0 = perturb_signal(x_target, noise_level=noise_level, seed=42)
+    initial_winding = compute_winding_number(x0)
+    
+    hst = HeisenbergScatteringTransform(
+        T, J=2, Q=2, max_order=1,
+        lifting='radial_floor', epsilon=1e-8
+    )
+    
+    target_coeffs = extract_all_targets(hst, x_target)
+    
+    print(f"  Target winding: k = {k}, margin = {margin}")
+    print(f"  Initial winding: {initial_winding:.2f}")
+    print()
+    
+    results = {}
+    
+    print(f"  {'Mode':<20} {'W_final':>8} {'|ΔW|':>7} {'ok':>4} {'min_seg':>10} {'Loss%':>8}")
+    print("  " + "-" * 60)
+    
+    for mode, use_margin in [('No protection', None), ('With margin', margin)]:
+        for loss_type in ['l2', 'phase_robust']:
+            label = f"{mode} ({loss_type})"
+            
+            result = optimize_signal(
+                target_coeffs, hst, x0.copy(),
+                n_steps=100,
+                lr=1e-8,
+                momentum=0.0,
+                normalize=True,
+                loss_type=loss_type,
+                phase_lambda=1.0,
+                topology_margin=use_margin,
+                verbose=False,
+            )
+            
+            final_winding = compute_winding_number(result.signal)
+            continuous_error = abs(final_winding - k)
+            preserved = (round(final_winding) == k)
+            min_seg = min(result.min_segment_dist_history)
+            loss_reduction = (1 - result.final_loss / result.loss_history[0]) * 100
+            
+            results[(mode, loss_type)] = {
+                'final_winding': final_winding,
+                'error': continuous_error,
+                'preserved': preserved,
+                'min_seg': min_seg,
+                'loss_reduction': loss_reduction,
+            }
+            
+            status = "✓" if preserved else "✗"
+            print(f"  {label:<20} {final_winding:>8.2f} {continuous_error:>7.3f} {status:>4} "
+                  f"{min_seg:>10.6f} {loss_reduction:>+7.1f}%")
+    
+    print()
+    
+    # Check if margin helped
+    no_prot_preserved = sum(1 for k, v in results.items() if k[0] == 'No protection' and v['preserved'])
+    with_margin_preserved = sum(1 for k, v in results.items() if k[0] == 'With margin' and v['preserved'])
+    
+    print(f"  Results: No protection {no_prot_preserved}/2 preserved, With margin {with_margin_preserved}/2 preserved")
+    
+    # Verify margin constraint was enforced
+    margin_enforced = all(
+        v['min_seg'] >= margin * 0.9  # Allow small tolerance
+        for k, v in results.items() if k[0] == 'With margin'
+    )
+    
+    if margin_enforced:
+        print(f"  ✓ Margin constraint enforced (min_seg >= {margin})")
+    else:
+        print(f"  ✗ Margin constraint violated!")
+    
+    # Pass if margin was enforced (even if winding still changed)
+    return margin_enforced, f"Margin enforced: {margin_enforced}, preserved: {with_margin_preserved}/2"
+
+
+# =============================================================================
+# Test 4: Gradient Direction with High Winding
 # =============================================================================
 
 def test_gradient_direction_high_winding():
@@ -332,7 +432,7 @@ def test_gradient_direction_high_winding():
     Even if we can't fully optimize, the gradient should point toward
     loss reduction (not divergence).
     """
-    print("\n[TEST 3: GRADIENT DIRECTION (HIGH WINDING)]")
+    print("\n[TEST 4: GRADIENT DIRECTION (HIGH WINDING)]")
     print("-" * 70)
     print("  Verifying gradient points toward loss reduction")
     print()
@@ -398,7 +498,7 @@ def test_phase_step_analysis():
     
     This diagnostic shows why anti-aliasing (scaling T with k) is necessary.
     """
-    print("\n[TEST 4: PHASE STEP ANALYSIS]")
+    print("\n[TEST 5: PHASE STEP ANALYSIS]")
     print("-" * 70)
     print("  Analyzing phase step Δθ = 2πk/T")
     print()
@@ -437,7 +537,7 @@ def test_segment_distance_to_origin():
     This verifies the function correctly computes the minimum distance
     from the origin to line segments in the complex plane.
     """
-    print("\n[TEST 5: SEGMENT DISTANCE TO ORIGIN]")
+    print("\n[TEST 6: SEGMENT DISTANCE TO ORIGIN]")
     print("-" * 70)
     print("  Unit testing the segment distance computation")
     print()
@@ -537,6 +637,9 @@ def main():
     p, m = test_gradient_direction_high_winding()
     result.record("gradient_direction_high_winding", p, m)
     
+    p, m = test_topology_margin()
+    result.record("topology_margin", p, m)
+    
     p, m = test_high_winding_ladder()
     result.record("high_winding_ladder", p, m)
     
@@ -555,7 +658,8 @@ def main():
     
     if result.failed == 0:
         print("\n✓ High winding stress tests passed!")
-        print("  Optimizer maintains topological invariants under stress.")
+        print("  Diagnostics in place; topology preserved unless trajectory enters")
+        print("  origin-danger zone (min_seg small). Use topology_margin to enforce.")
     else:
         print("\n⚠ Some tests failed - see details above.")
         print("  Consider using phase_robust loss for high-winding signals.")

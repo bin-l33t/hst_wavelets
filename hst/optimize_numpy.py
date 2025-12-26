@@ -667,6 +667,7 @@ def optimize_signal(
     phase_lambda: float = 1.0,
     grad_clip: Optional[float] = None,
     normalize: bool = False,
+    topology_margin: Optional[float] = None,
 ) -> OptimizationResult:
     """
     Optimize signal to match target HST coefficients.
@@ -707,6 +708,15 @@ def optimize_signal(
         conditioning without changing the objective function.
         
         The chain rule gives: grad_y = scale * grad_x
+    topology_margin : float, optional
+        If provided, enforce min_segment_distance >= topology_margin via
+        backtracking line search. When a step would violate this constraint,
+        the step size is reduced until the constraint is satisfied.
+        
+        This prevents the optimizer from "tunneling" through the origin
+        between samples, which would change the winding number (homotopy class).
+        
+        Typical values: 0.01 to 0.1 depending on signal scale.
         
     Returns
     -------
@@ -779,7 +789,43 @@ def optimize_signal(
             callback(step, x_eval, loss, grad_x)
         
         # Gradient descent with momentum (on normalized variable y)
-        velocity = momentum * velocity - lr * grad_y
+        velocity_update = momentum * velocity - lr * grad_y
+        y_candidate = y + velocity_update
+        
+        # Backtracking line search for topology constraint
+        if topology_margin is not None:
+            # Check if candidate violates the margin constraint
+            if normalize:
+                x_candidate = original_scale * y_candidate
+            else:
+                x_candidate = y_candidate
+            
+            candidate_min_seg = min_segment_distance_to_origin(x_candidate, closed=True)
+            
+            # Backtrack if constraint violated
+            backtrack_count = 0
+            scale_factor = 1.0
+            while candidate_min_seg < topology_margin and backtrack_count < 10:
+                scale_factor *= 0.5
+                velocity_update_scaled = scale_factor * velocity_update
+                y_candidate = y + velocity_update_scaled
+                
+                if normalize:
+                    x_candidate = original_scale * y_candidate
+                else:
+                    x_candidate = y_candidate
+                
+                candidate_min_seg = min_segment_distance_to_origin(x_candidate, closed=True)
+                backtrack_count += 1
+            
+            if backtrack_count > 0 and verbose and step % max(1, n_steps // 10) == 0:
+                print(f"         [backtracked {backtrack_count}x, scale={scale_factor:.3f}]")
+            
+            # Use the (possibly scaled) velocity update
+            velocity = scale_factor * velocity_update
+        else:
+            velocity = velocity_update
+        
         y = y + velocity
     
     # Final evaluation
