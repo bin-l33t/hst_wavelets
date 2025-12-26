@@ -132,6 +132,109 @@ def demean(x: np.ndarray) -> Tuple[np.ndarray, complex]:
     return x - dc, dc
 
 
+# =============================================================================
+# Topology Diagnostic Utilities
+# =============================================================================
+
+def segment_distance_to_origin(z1: complex, z2: complex) -> float:
+    """
+    Compute the minimum distance from the origin to the line segment [z1, z2].
+    
+    This is crucial for detecting "tunneling" through the origin between samples.
+    A trajectory can change winding number only if it crosses the origin, which
+    in discrete sampling means a segment passes through or near zero.
+    
+    Parameters
+    ----------
+    z1, z2 : complex
+        Endpoints of the segment
+        
+    Returns
+    -------
+    dist : float
+        Minimum distance from origin to the segment [z1, z2]
+        
+    Notes
+    -----
+    The distance is computed as:
+    - If the projection of 0 onto the line falls within the segment:
+      perpendicular distance = |Im(z1 * conj(z2))| / |z1 - z2|
+    - Otherwise: min(|z1|, |z2|)
+    
+    Geometrically, this finds the closest point on the segment to the origin.
+    """
+    # Handle degenerate case
+    d = z2 - z1
+    if abs(d) < 1e-15:
+        return abs(z1)
+    
+    # Parameterize segment as z1 + t*(z2-z1) for t in [0,1]
+    # The closest point to origin has t = -Re(z1 * conj(d)) / |d|^2
+    # (projection of -z1 onto direction d)
+    t = -np.real(z1 * np.conj(d)) / (abs(d)**2)
+    
+    if t <= 0:
+        # Closest point is z1
+        return abs(z1)
+    elif t >= 1:
+        # Closest point is z2
+        return abs(z2)
+    else:
+        # Closest point is interior to segment
+        # Perpendicular distance = |Im(z1 * conj(z2))| / |z2 - z1|
+        # This is the area of triangle (0, z1, z2) divided by base length
+        closest = z1 + t * d
+        return abs(closest)
+
+
+def min_segment_distance_to_origin(x: np.ndarray, closed: bool = True) -> float:
+    """
+    Compute the minimum distance from the origin to any segment of the path.
+    
+    This is the key "topology danger" indicator: winding can only change if
+    some segment passes through or very close to the origin.
+    
+    Parameters
+    ----------
+    x : ndarray, complex
+        Complex signal representing a path
+    closed : bool
+        If True, also consider the segment from x[-1] to x[0] (closed curve)
+        
+    Returns
+    -------
+    min_dist : float
+        Minimum distance from origin to any segment
+        
+    Examples
+    --------
+    >>> x = np.array([1+1j, 1-1j, -1-1j, -1+1j])  # Square around origin
+    >>> min_segment_distance_to_origin(x)  # Should be ~1.0
+    1.0
+    
+    >>> x = np.array([2+0j, 0+2j])  # Segment passing near origin
+    >>> min_segment_distance_to_origin(x, closed=False)  # Should be ~sqrt(2)
+    1.414...
+    """
+    n = len(x)
+    if n < 2:
+        return abs(x[0]) if n == 1 else float('inf')
+    
+    min_dist = float('inf')
+    
+    # Check all consecutive segments
+    for i in range(n - 1):
+        dist = segment_distance_to_origin(x[i], x[i+1])
+        min_dist = min(min_dist, dist)
+    
+    # Optionally check closing segment
+    if closed:
+        dist = segment_distance_to_origin(x[-1], x[0])
+        min_dist = min(min_dist, dist)
+    
+    return min_dist
+
+
 def compute_loss_and_grad_order1(
     x: np.ndarray,
     hst,
@@ -599,79 +702,116 @@ def optimize_signal(
         Useful for signals with poor conditioning (e.g., radial_floor on
         zero-mean signals).
     normalize : bool
-        If True, optimize on unit-energy signal internally and restore
-        scale at the end. Improves conditioning for radial_floor lifting.
+        If True, optimize in normalized coordinates (y = x/||x||) but
+        evaluate loss on scaled signal (x = scale * y). This improves
+        conditioning without changing the objective function.
+        
+        The chain rule gives: grad_y = scale * grad_x
         
     Returns
     -------
     result : OptimizationResult
+        
+    Notes
+    -----
+    The result includes `min_magnitude_history` when normalize=True,
+    which tracks how close the signal gets to the origin during optimization.
+    This is a "topology danger" indicator - winding changes require
+    passing through or near the origin.
     """
     x = x0.copy().astype(np.complex128)
     
     # Optional energy normalization for better conditioning
+    # Key insight: optimize in normalized coordinates (y) but evaluate loss on
+    # scaled signal (x = scale * y). This is preconditioning, not a new objective.
     if normalize:
-        x, original_scale = normalize_energy(x)
+        original_scale = np.linalg.norm(x)
+        if original_scale < 1e-15:
+            original_scale = 1.0
+        y = x / original_scale  # Normalized variable ||y|| ≈ 1
     else:
         original_scale = 1.0
+        y = x  # y is just x
     
-    velocity = np.zeros_like(x)
+    velocity = np.zeros_like(y)
     
     loss_history = []
     grad_norm_history = []
-    
-    # Compute initial signal energy for normalized logging
-    initial_energy = np.linalg.norm(x0)
+    min_magnitude_history = []  # Track pointwise proximity to origin
+    min_segment_dist_history = []  # Track segment proximity (better for topology)
     
     for step in range(n_steps):
-        loss, grad = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
+        # Evaluate loss on the SCALED signal (preserves original objective)
+        if normalize:
+            x_eval = original_scale * y
+        else:
+            x_eval = y
+            
+        loss, grad_x = compute_loss_and_grad(x_eval, hst, target_coeffs, weights, loss_type, phase_lambda)
         
-        grad_norm = np.linalg.norm(grad)
-        signal_norm = np.linalg.norm(x)
+        # Chain rule: grad_y = original_scale * grad_x (since x = scale * y)
+        if normalize:
+            grad_y = original_scale * grad_x
+        else:
+            grad_y = grad_x
+        
+        grad_norm = np.linalg.norm(grad_y)
+        
+        # Track topology danger indicators
+        min_mag = np.min(np.abs(x_eval))
+        min_seg_dist = min_segment_distance_to_origin(x_eval, closed=True)
+        min_magnitude_history.append(min_mag)
+        min_segment_dist_history.append(min_seg_dist)
         
         # Gradient clipping
         if grad_clip is not None and grad_norm > grad_clip:
-            grad = grad * (grad_clip / grad_norm)
+            grad_y = grad_y * (grad_clip / grad_norm)
             grad_norm = grad_clip
         
         loss_history.append(loss)
         grad_norm_history.append(grad_norm)
         
         if verbose and step % max(1, n_steps // 10) == 0:
-            # Show normalized loss (per unit energy) for scale-invariant tracking
-            normalized_loss = loss / (signal_norm**2 + 1e-15)
-            print(f"  Step {step:4d}: loss = {loss:.6e}, "
-                  f"loss/||x||² = {normalized_loss:.6e}, |grad| = {grad_norm:.6e}")
+            print(f"  Step {step:4d}: loss = {loss:.6e}, |grad| = {grad_norm:.6e}, "
+                  f"min|x| = {min_mag:.4e}, min_seg = {min_seg_dist:.4e}")
         
         if callback is not None:
-            callback(step, x, loss, grad)
+            callback(step, x_eval, loss, grad_x)
         
-        # Gradient descent with momentum
-        velocity = momentum * velocity - lr * grad
-        x = x + velocity
-        
-        # Ensure signal stays away from singularities (optional constraint)
-        # This is handled by the lifting mechanism in the forward pass
+        # Gradient descent with momentum (on normalized variable y)
+        velocity = momentum * velocity - lr * grad_y
+        y = y + velocity
     
-    # Final loss
-    final_loss, _ = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
-    loss_history.append(final_loss)
-    
-    # Restore original scale if normalized
+    # Final evaluation
     if normalize:
-        x = denormalize_energy(x, original_scale)
+        x_final = original_scale * y
+    else:
+        x_final = y
+        
+    final_loss, _ = compute_loss_and_grad(x_final, hst, target_coeffs, weights, loss_type, phase_lambda)
+    loss_history.append(final_loss)
+    min_magnitude_history.append(np.min(np.abs(x_final)))
+    min_segment_dist_history.append(min_segment_distance_to_origin(x_final, closed=True))
     
     if verbose:
-        print(f"  Final: loss = {final_loss:.6e}")
+        print(f"  Final: loss = {final_loss:.6e}, min|x| = {min_magnitude_history[-1]:.4e}, "
+              f"min_seg = {min_segment_dist_history[-1]:.4e}")
     
     converged = len(loss_history) > 1 and loss_history[-1] < loss_history[0] * 0.01
     
-    return OptimizationResult(
-        signal=x,
+    result = OptimizationResult(
+        signal=x_final,
         loss_history=loss_history,
         grad_norm_history=grad_norm_history,
         final_loss=final_loss,
         converged=converged,
     )
+    
+    # Attach topology diagnostics as extra attributes
+    result.min_magnitude_history = min_magnitude_history
+    result.min_segment_dist_history = min_segment_dist_history
+    
+    return result
 
 
 # =============================================================================
