@@ -303,13 +303,68 @@ def _compute_winding_inline(z: np.ndarray, high_precision: bool = True) -> float
     return float(winding)
 
 
-def compute_winding_number(z: np.ndarray) -> float:
+def compute_winding_atan2(z: np.ndarray) -> float:
+    """
+    Compute winding number using per-edge atan2 method.
+    
+    This is the most robust method, avoiding np.unwrap bookkeeping issues.
+    Each edge contributes atan2(cross, dot) which is the signed angle change.
+    
+    Parameters
+    ----------
+    z : ndarray, complex
+        Complex signal (treated as closed curve, z[-1] connects to z[0])
+        
+    Returns
+    -------
+    winding : float
+        Winding number around the origin
+        
+    Notes
+    -----
+    For each consecutive pair (z_i, z_{i+1}), the angle change is:
+        Δθ = atan2(Im(conj(z_i) * z_{i+1}), Re(conj(z_i) * z_{i+1}))
+    
+    This equals atan2(cross product, dot product) which gives the signed
+    angle between the two vectors from the origin.
+    """
+    z = np.asarray(z, dtype=np.complex128)
+    n = len(z)
+    
+    total = 0.0
+    for i in range(n):
+        z_i = z[i]
+        z_next = z[(i + 1) % n]  # Closes the curve
+        
+        # Cross and dot products (treating complex as 2D vectors)
+        cross = z_i.real * z_next.imag - z_i.imag * z_next.real
+        dot = z_i.real * z_next.real + z_i.imag * z_next.imag
+        
+        total += np.arctan2(cross, dot)
+    
+    return total / (2 * np.pi)
+
+
+def compute_winding_number(z: np.ndarray, method: str = 'diff') -> float:
     """
     Public API for winding number computation.
     
-    Wrapper around _compute_winding_inline for external use.
+    Parameters
+    ----------
+    z : ndarray, complex
+        Complex signal
+    method : str
+        'diff' - Use phase difference method (default, fast)
+        'atan2' - Use per-edge atan2 method (robust, slower)
+        
+    Returns
+    -------
+    winding : float
     """
-    return _compute_winding_inline(z, high_precision=True)
+    if method == 'atan2':
+        return compute_winding_atan2(z)
+    else:
+        return _compute_winding_inline(z, high_precision=True)
 
 
 def detect_winding_change(winding_history: List[float], tolerance: float = 0.3) -> dict:
@@ -356,6 +411,65 @@ def detect_winding_change(winding_history: List[float], tolerance: float = 0.3) 
         'change_step': change_step,
         'max_deviation': max_deviation,
         'fractional_history': fractional,
+    }
+
+
+def check_topology_invariant(
+    winding_history: List[float],
+    min_seg_history: List[float],
+    margin: float = 0.1,
+) -> dict:
+    """
+    Check the topology invariant: winding should not change when min_seg > margin.
+    
+    This is the "smoking gun" test suggested by ChatGPT. If this invariant is 
+    violated, there's a bug in the winding or min_seg computation.
+    
+    Parameters
+    ----------
+    winding_history : list of float
+        Winding numbers at each step
+    min_seg_history : list of float
+        Minimum segment distance to origin at each step
+    margin : float
+        Topology margin - winding should be stable when min_seg > margin
+        
+    Returns
+    -------
+    result : dict
+        - 'passed': bool, whether invariant holds
+        - 'violations': list of (step, w_before, w_after, min_seg_before, min_seg_after)
+        - 'n_violations': number of violations
+        
+    Notes
+    -----
+    The invariant is:
+        If min_seg[i] > margin AND min_seg[i+1] > margin,
+        then round(W[i]) == round(W[i+1])
+        
+    This must hold because winding can only change by crossing the origin,
+    which requires min_seg to be very small at some point.
+    """
+    violations = []
+    
+    for i in range(len(winding_history) - 1):
+        if min_seg_history[i] > margin and min_seg_history[i+1] > margin:
+            w_i = round(winding_history[i])
+            w_next = round(winding_history[i+1])
+            if w_i != w_next:
+                violations.append((
+                    i,
+                    w_i,
+                    w_next,
+                    min_seg_history[i],
+                    min_seg_history[i+1]
+                ))
+    
+    return {
+        'passed': len(violations) == 0,
+        'violations': violations,
+        'n_violations': len(violations),
+        'margin': margin,
     }
 
 
