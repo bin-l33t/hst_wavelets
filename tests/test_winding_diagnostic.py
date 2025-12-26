@@ -26,7 +26,9 @@ from hst.optimize_numpy import (
     optimize_signal,
     extract_all_targets,
     compute_winding_number,
+    compute_winding_atan2,
     detect_winding_change,
+    check_topology_invariant,
     min_segment_distance_to_origin,
     _compute_winding_inline,
 )
@@ -245,7 +247,7 @@ def test_winding_with_topology_margin():
     
     base_T = 64
     noise_level = 0.02
-    margin = 0.01
+    margin = 0.05  # Use a reasonable margin
     
     print(f"\nTopology margin: {margin}")
     print(f"{'Case':<20} {'W_initial':>10} {'W_final':>10} {'Protected':>10} {'min_seg':>12}")
@@ -265,7 +267,7 @@ def test_winding_with_topology_margin():
         
         target_coeffs = extract_all_targets(hst, x_target)
         
-        # With topology margin
+        # With topology margin (now homotopy-aware!)
         result = optimize_signal(
             target_coeffs, hst, x0.copy(),
             n_steps=100,
@@ -285,6 +287,85 @@ def test_winding_with_topology_margin():
         
         case_name = f"k={k} {loss_type}"
         print(f"{case_name:<20} {initial_w:>10} {final_w:>10} {protected:>10} {min_seg:>12.6f}")
+
+
+def test_homotopy_guard():
+    """
+    Verify that homotopy-aware guard catches tunneling that endpoint checks miss.
+    """
+    print("\n" + "="*70)
+    print("TEST: HOMOTOPY-AWARE GUARD (ChatGPT's insight)")
+    print("="*70)
+    
+    from hst.optimize_numpy import min_seg_along_homotopy
+    
+    # Create a synthetic case where endpoints are far but path crosses near origin
+    T = 64
+    t = np.arange(T)
+    
+    # x_old: circle far from origin
+    x_old = 2.0 + 0.5 * np.exp(1j * 2 * np.pi * t / T)
+    
+    # x_new: circle on opposite side, also far from origin
+    x_new = -2.0 + 0.5 * np.exp(1j * 2 * np.pi * t / T)
+    
+    # Endpoint checks
+    min_seg_old = min_segment_distance_to_origin(x_old, closed=True)
+    min_seg_new = min_segment_distance_to_origin(x_new, closed=True)
+    
+    # Homotopy check
+    homotopy_min, worst_s = min_seg_along_homotopy(x_old, x_new)
+    
+    print(f"\nSynthetic tunneling test:")
+    print(f"  x_old: circle centered at +2 (min_seg = {min_seg_old:.4f})")
+    print(f"  x_new: circle centered at -2 (min_seg = {min_seg_new:.4f})")
+    print(f"  Homotopy path minimum: {homotopy_min:.4f} at s={worst_s:.2f}")
+    
+    # The homotopy should pass through/near origin around s=0.5
+    if homotopy_min < 0.1 and min_seg_old > 1.0 and min_seg_new > 1.0:
+        print(f"  ✓ Homotopy guard correctly detects tunneling!")
+        print(f"    (Endpoints look safe, but path crosses near origin)")
+    else:
+        print(f"  ✗ Test setup issue or guard not working")
+    
+    # Now test on actual optimization case
+    print(f"\nReal optimization test (k=16, l2):")
+    
+    k = 16
+    T = 64 * k
+    x_target = create_winding_signal(T, k)
+    np.random.seed(42)
+    x0 = x_target + 0.02 * (np.random.randn(T) + 1j * np.random.randn(T))
+    
+    hst = HeisenbergScatteringTransform(T, J=2, Q=2, max_order=1, lifting='radial_floor', epsilon=1e-8)
+    target_coeffs = extract_all_targets(hst, x_target)
+    
+    # Without margin
+    result_no_margin = optimize_signal(
+        target_coeffs, hst, x0.copy(), n_steps=100, lr=1e-8,
+        normalize=True, loss_type='l2', verbose=False
+    )
+    
+    # With homotopy-aware margin
+    result_with_margin = optimize_signal(
+        target_coeffs, hst, x0.copy(), n_steps=100, lr=1e-8,
+        normalize=True, loss_type='l2', topology_margin=0.05, verbose=False
+    )
+    
+    w_initial = round(result_no_margin.winding_history[0])
+    w_final_no = round(result_no_margin.winding_history[-1])
+    w_final_with = round(result_with_margin.winding_history[-1])
+    
+    print(f"  Initial winding: {w_initial}")
+    print(f"  Final winding (no margin): {w_final_no}")
+    print(f"  Final winding (with homotopy guard): {w_final_with}")
+    
+    if w_initial == w_final_with and w_initial != w_final_no:
+        print(f"  ✓ Homotopy guard preserved winding!")
+    elif w_initial == w_final_with == w_final_no:
+        print(f"  ⚠ Both preserved winding (margin may not have been needed)")
+    else:
+        print(f"  ✗ Homotopy guard did not preserve winding")
 
 
 def test_detailed_trajectory_analysis():
@@ -338,102 +419,159 @@ def test_detailed_trajectory_analysis():
     print(f"  Step {len(wh)-1:3d}: W={wh[-1]:8.4f} (dev={wh[-1]-round(wh[-1]):+.4f}), min_seg={msh[-1]:.6f}")
 
 
-def test_step_by_step_winding_change():
+def test_winding_consistency():
     """
-    Fine-grained analysis of the exact step where winding changes.
+    ChatGPT-requested diagnostic: prove consistency between winding methods.
+    
+    1. Compute winding two ways (diff vs atan2) and flag disagreements
+    2. Log exact min_seg at the step where winding changes
+    3. Run topology invariant check
     """
     print("\n" + "="*70)
-    print("TEST: STEP-BY-STEP WINDING CHANGE ANALYSIS")
+    print("TEST: WINDING CONSISTENCY (ChatGPT Diagnostic)")
     print("="*70)
     
-    k = 16
-    T = 64 * k
+    from hst.optimize_numpy import (
+        compute_winding_number,
+        compute_winding_atan2,
+        check_topology_invariant,
+        _compute_winding_inline,
+    )
+    
+    # Focus on the cases that showed anomalies
+    test_cases = [
+        (16, 'phase_robust'),
+        (32, 'phase_robust'),
+    ]
+    
+    base_T = 64
     noise_level = 0.02
+    MARGIN = 0.1
     
-    x_target = create_winding_signal(T, k, radius=1.0)
-    np.random.seed(42)
-    x0 = x_target + noise_level * (np.random.randn(T) + 1j * np.random.randn(T))
-    
-    hst = HeisenbergScatteringTransform(
-        T, J=2, Q=2, max_order=1,
-        lifting='radial_floor', epsilon=1e-8
-    )
-    
-    target_coeffs = extract_all_targets(hst, x_target)
-    
-    # Track signal state at each step
-    print("\nRunning optimization with per-step signal capture...")
-    
-    signals_at_steps = []
-    
-    def capture_callback(step, x, loss, grad):
-        signals_at_steps.append((step, x.copy()))
-    
-    result = optimize_signal(
-        target_coeffs, hst, x0.copy(),
-        n_steps=50,  # Shorter run, focused on change region
-        lr=1e-8,
-        momentum=0.0,
-        normalize=True,
-        loss_type='phase_robust',
-        phase_lambda=1.0,
-        verbose=False,
-        callback=capture_callback,
-    )
-    
-    # Find where winding changes
-    print("\nStep-by-step winding analysis:")
-    print(f"{'Step':>4} {'W':>10} {'min_seg':>12} {'min|z|':>12} {'Phase range':>15}")
-    print("-" * 60)
-    
-    prev_w = None
-    change_step = None
-    
-    for step, x in signals_at_steps:
-        w = compute_winding_number(x)
-        ms = min_segment_distance_to_origin(x, closed=True)
-        min_z = np.min(np.abs(x))
+    for k, loss_type in test_cases:
+        print(f"\n{'='*60}")
+        print(f"k={k}, loss={loss_type}")
+        print(f"{'='*60}")
         
-        # Compute phase range
-        phases = np.angle(x)
-        phase_range = np.max(phases) - np.min(phases)
+        T = base_T * k
         
-        w_int = round(w)
-        if prev_w is not None and w_int != prev_w:
-            print(f"{step:>4} {w:>10.4f} {ms:>12.6f} {min_z:>12.6f} {phase_range:>15.4f}  <-- CHANGE!")
-            change_step = step
+        x_target = create_winding_signal(T, k, radius=1.0)
+        np.random.seed(42)
+        x0 = x_target + noise_level * (np.random.randn(T) + 1j * np.random.randn(T))
+        
+        hst = HeisenbergScatteringTransform(
+            T, J=2, Q=2, max_order=1,
+            lifting='radial_floor', epsilon=1e-8
+        )
+        
+        target_coeffs = extract_all_targets(hst, x_target)
+        
+        # Capture ALL signals for detailed analysis
+        all_signals = []
+        
+        def capture_all(step, x, loss, grad):
+            all_signals.append((step, x.copy()))
+        
+        result = optimize_signal(
+            target_coeffs, hst, x0.copy(),
+            n_steps=100,
+            lr=1e-8,
+            momentum=0.0,
+            normalize=True,
+            loss_type=loss_type,
+            phase_lambda=1.0,
+            verbose=False,
+            callback=capture_all,
+        )
+        
+        # 1. Compare winding methods at every step
+        print("\n1. WINDING METHOD COMPARISON (diff vs atan2)")
+        print("-" * 50)
+        
+        disagreements = []
+        winding_diff_history = []
+        winding_atan2_history = []
+        min_seg_at_step = []
+        
+        for step, x in all_signals:
+            w_diff = _compute_winding_inline(x)
+            w_atan2 = compute_winding_atan2(x)
+            ms = min_segment_distance_to_origin(x, closed=True)
+            
+            winding_diff_history.append(w_diff)
+            winding_atan2_history.append(w_atan2)
+            min_seg_at_step.append(ms)
+            
+            if abs(w_diff - w_atan2) > 0.1:
+                disagreements.append((step, w_diff, w_atan2, ms))
+        
+        if disagreements:
+            print(f"  ⚠ {len(disagreements)} DISAGREEMENTS found:")
+            for step, wd, wa, ms in disagreements[:5]:
+                print(f"    Step {step}: diff={wd:.4f}, atan2={wa:.4f}, min_seg={ms:.6f}")
         else:
-            print(f"{step:>4} {w:>10.4f} {ms:>12.6f} {min_z:>12.6f} {phase_range:>15.4f}")
+            print(f"  ✓ All {len(all_signals)} steps agree (diff ≈ atan2)")
         
-        prev_w = w_int
-    
-    if change_step is not None:
-        # Detailed comparison of step before and after change
-        print(f"\n--- Detailed comparison around step {change_step} ---")
+        # 2. Find winding change points and log 5-step window
+        print("\n2. WINDING CHANGE POINTS (5-step window)")
+        print("-" * 50)
         
-        idx = change_step
-        x_before = signals_at_steps[idx-1][1]
-        x_after = signals_at_steps[idx][1]
+        prev_w = round(winding_diff_history[0])
+        change_steps = []
         
-        print(f"\nPhase unwrapping comparison:")
+        for i, w in enumerate(winding_diff_history):
+            curr_w = round(w)
+            if curr_w != prev_w:
+                change_steps.append((i, prev_w, curr_w))
+                prev_w = curr_w
         
-        phases_before = np.unwrap(np.angle(x_before))
-        phases_after = np.unwrap(np.angle(x_after))
+        if not change_steps:
+            print(f"  No winding changes detected. Final winding: {round(winding_diff_history[-1])}")
+        else:
+            print(f"  {len(change_steps)} winding changes detected")
+            
+            # Show first 3 changes with 5-step windows
+            for change_idx, (step, w_before, w_after) in enumerate(change_steps[:3]):
+                print(f"\n  Change #{change_idx+1}: Step {step}, W: {w_before} → {w_after}")
+                print(f"  {'Step':>6} {'W_diff':>10} {'W_atan2':>10} {'min_seg':>12} {'Note':>10}")
+                print(f"  {'-'*50}")
+                
+                # 5-step window around change
+                start = max(0, step - 2)
+                end = min(len(all_signals), step + 3)
+                
+                for i in range(start, end):
+                    wd = winding_diff_history[i]
+                    wa = winding_atan2_history[i]
+                    ms = min_seg_at_step[i]
+                    note = "<-- CHANGE" if i == step else ""
+                    print(f"  {i:>6} {wd:>10.4f} {wa:>10.4f} {ms:>12.6f} {note:>10}")
         
-        total_phase_before = phases_before[-1] - phases_before[0]
-        total_phase_after = phases_after[-1] - phases_after[0]
+        # 3. Run topology invariant check
+        print("\n3. TOPOLOGY INVARIANT CHECK")
+        print("-" * 50)
         
-        print(f"  Total unwrapped phase before: {total_phase_before:.4f} rad ({total_phase_before/(2*np.pi):.2f} turns)")
-        print(f"  Total unwrapped phase after:  {total_phase_after:.4f} rad ({total_phase_after/(2*np.pi):.2f} turns)")
+        invariant_result = check_topology_invariant(
+            winding_diff_history,
+            min_seg_at_step,
+            margin=MARGIN
+        )
         
-        # Check for large phase jumps in the signal
-        print(f"\n  Max phase jump before: {np.max(np.abs(np.diff(np.angle(x_before)))):.4f} rad")
-        print(f"  Max phase jump after:  {np.max(np.abs(np.diff(np.angle(x_after)))):.4f} rad")
+        if invariant_result['passed']:
+            print(f"  ✓ PASSED: No violations with margin={MARGIN}")
+            print(f"    (Winding only changes when min_seg < {MARGIN})")
+        else:
+            print(f"  ✗ FAILED: {invariant_result['n_violations']} violations with margin={MARGIN}")
+            for step, w1, w2, ms1, ms2 in invariant_result['violations'][:3]:
+                print(f"    Step {step}→{step+1}: W={w1}→{w2}, min_seg={ms1:.6f}→{ms2:.6f}")
+            print(f"    This indicates a BUG: winding changed without origin crossing!")
         
-        # Check signal difference
-        diff = x_after - x_before
-        print(f"\n  Signal change magnitude: {np.linalg.norm(diff):.6f}")
-        print(f"  Max pointwise change:    {np.max(np.abs(diff)):.6f}")
+        # Summary
+        print(f"\n  SUMMARY for k={k} {loss_type}:")
+        print(f"    Initial winding: {round(winding_diff_history[0])}")
+        print(f"    Final winding: {round(winding_diff_history[-1])}")
+        print(f"    Method agreement: {'YES' if not disagreements else 'NO'}")
+        print(f"    Invariant passed: {'YES' if invariant_result['passed'] else 'NO'}")
 
 
 def main():
@@ -444,10 +582,15 @@ def main():
     
     # Run tests
     test_winding_precision()
+    test_winding_consistency()  # ChatGPT's requested diagnostic
+    test_homotopy_guard()  # NEW: Test the homotopy-aware guard
     test_winding_change_correlation()
     test_winding_with_topology_margin()
-    test_step_by_step_winding_change()
     test_detailed_trajectory_analysis()
+    
+    print("\n" + "="*70)
+    print("DIAGNOSTIC COMPLETE")
+    print("="*70)
     
     print("\n" + "="*70)
     print("DIAGNOSTIC COMPLETE")

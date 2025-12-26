@@ -473,6 +473,97 @@ def check_topology_invariant(
     }
 
 
+def min_seg_along_homotopy(
+    x_old: np.ndarray,
+    x_new: np.ndarray,
+    n_coarse: int = 21,
+    refine_threshold: float = 5.0,
+    n_refine: int = 10,
+) -> Tuple[float, float]:
+    """
+    Compute minimum segment distance along the linear homotopy from x_old to x_new.
+    
+    This catches "tunneling" where the optimizer steps over the origin even when
+    both endpoints are far from it.
+    
+    Parameters
+    ----------
+    x_old : ndarray, complex
+        Starting signal
+    x_new : ndarray, complex
+        Ending signal
+    n_coarse : int
+        Number of coarse samples along homotopy (default 21 for s in [0, 1])
+    refine_threshold : float
+        If coarse min is less than refine_threshold * margin, do local refinement
+    n_refine : int
+        Number of refinement iterations (bisection)
+        
+    Returns
+    -------
+    min_dist : float
+        Minimum segment distance along the entire homotopy
+    worst_s : float
+        Parameter value where minimum occurs (0 = x_old, 1 = x_new)
+        
+    Notes
+    -----
+    The homotopy is: x(s) = (1-s) * x_old + s * x_new for s in [0, 1]
+    
+    Algorithm:
+    1. Coarse sampling: evaluate min_seg at n_coarse points
+    2. Find the interval with minimum value
+    3. If min is close to threshold, refine by bisection in that interval
+    """
+    # Coarse sampling
+    s_values = np.linspace(0, 1, n_coarse)
+    min_segs = np.zeros(n_coarse)
+    
+    for i, s in enumerate(s_values):
+        x_interp = (1 - s) * x_old + s * x_new
+        min_segs[i] = min_segment_distance_to_origin(x_interp, closed=True)
+    
+    # Find worst (minimum) point
+    worst_idx = np.argmin(min_segs)
+    min_dist = min_segs[worst_idx]
+    worst_s = s_values[worst_idx]
+    
+    # Adaptive refinement if the minimum is concerning
+    # Refine around the worst interval
+    if worst_idx > 0 and worst_idx < n_coarse - 1:
+        s_left = s_values[worst_idx - 1]
+        s_right = s_values[worst_idx + 1]
+        
+        # Bisection refinement
+        for _ in range(n_refine):
+            s_mid_left = (s_left + worst_s) / 2
+            s_mid_right = (worst_s + s_right) / 2
+            
+            x_mid_left = (1 - s_mid_left) * x_old + s_mid_left * x_new
+            x_mid_right = (1 - s_mid_right) * x_old + s_mid_right * x_new
+            
+            dist_left = min_segment_distance_to_origin(x_mid_left, closed=True)
+            dist_right = min_segment_distance_to_origin(x_mid_right, closed=True)
+            
+            # Update bounds based on which side has lower distance
+            if dist_left < min_dist:
+                min_dist = dist_left
+                worst_s = s_mid_left
+                s_right = worst_s + (s_right - s_left) / 4
+                s_left = worst_s - (s_right - s_left) / 4
+            elif dist_right < min_dist:
+                min_dist = dist_right
+                worst_s = s_mid_right
+                s_left = worst_s - (s_right - s_left) / 4
+                s_right = worst_s + (s_right - s_left) / 4
+            else:
+                # Narrow the interval
+                s_left = s_mid_left
+                s_right = s_mid_right
+    
+    return float(min_dist), float(worst_s)
+
+
 def compute_loss_and_grad_order1(
     x: np.ndarray,
     hst,
@@ -1043,12 +1134,14 @@ def optimize_signal(
             else:
                 x_candidate = y_candidate
             
-            candidate_min_seg = min_segment_distance_to_origin(x_candidate, closed=True)
+            # ChatGPT insight: Check the ENTIRE homotopy path, not just endpoints!
+            # The optimizer can "tunnel" through the origin even if both endpoints are safe.
+            homotopy_min_seg, worst_s = min_seg_along_homotopy(x_eval, x_candidate)
             
-            # Backtrack if constraint violated
+            # Backtrack if homotopy path violates the margin
             backtrack_count = 0
             scale_factor = 1.0
-            while candidate_min_seg < topology_margin and backtrack_count < 10:
+            while homotopy_min_seg < topology_margin and backtrack_count < 10:
                 scale_factor *= 0.5
                 velocity_update_scaled = scale_factor * velocity_update
                 y_candidate = y + velocity_update_scaled
@@ -1058,14 +1151,21 @@ def optimize_signal(
                 else:
                     x_candidate = y_candidate
                 
-                candidate_min_seg = min_segment_distance_to_origin(x_candidate, closed=True)
+                homotopy_min_seg, worst_s = min_seg_along_homotopy(x_eval, x_candidate)
                 backtrack_count += 1
             
             if backtrack_count > 0 and verbose and step % max(1, n_steps // 10) == 0:
-                print(f"         [backtracked {backtrack_count}x, scale={scale_factor:.3f}]")
+                print(f"         [backtracked {backtrack_count}x, scale={scale_factor:.3f}, "
+                      f"homotopy_min={homotopy_min_seg:.4f} at s={worst_s:.2f}]")
             
-            # Use the (possibly scaled) velocity update
-            velocity = scale_factor * velocity_update
+            # If we still violate after max backtracking, skip update entirely
+            if homotopy_min_seg < topology_margin:
+                if verbose and step % max(1, n_steps // 10) == 0:
+                    print(f"         [SKIPPED update: homotopy would cross margin]")
+                velocity = np.zeros_like(velocity)  # Reset velocity, skip update
+            else:
+                # Use the (possibly scaled) velocity update
+                velocity = scale_factor * velocity_update
         else:
             velocity = velocity_update
         
