@@ -166,7 +166,61 @@ class IsingModel:
                 accepted += 1
         return accepted
     
-    def equilibrate(self, T: float, n_sweeps: int = 1000, verbose: bool = False):
+    def wolff_step(self, T: float) -> int:
+        """
+        Single Wolff cluster update.
+        
+        Much more efficient than Metropolis near Tc (no critical slowing down).
+        
+        Returns size of flipped cluster.
+        """
+        L = self.L
+        p_add = 1 - np.exp(-2 * self.J / T)  # Probability to add aligned neighbor
+        
+        # Pick random seed site
+        i0, j0 = self.rng.integers(0, L), self.rng.integers(0, L)
+        seed_spin = self.spins[i0, j0]
+        
+        # Grow cluster using BFS
+        cluster = set()
+        stack = [(i0, j0)]
+        
+        while stack:
+            i, j = stack.pop()
+            if (i, j) in cluster:
+                continue
+            if self.spins[i, j] != seed_spin:
+                continue
+            
+            cluster.add((i, j))
+            
+            # Try to add neighbors
+            for ni, nj in [(i+1, j), (i-1, j), (i, j+1), (i, j-1)]:
+                ni, nj = ni % L, nj % L
+                if (ni, nj) not in cluster:
+                    if self.spins[ni, nj] == seed_spin:
+                        if self.rng.random() < p_add:
+                            stack.append((ni, nj))
+        
+        # Flip entire cluster
+        for i, j in cluster:
+            self.spins[i, j] = -self.spins[i, j]
+        
+        return len(cluster)
+    
+    def wolff_sweep(self, T: float, n_clusters: int = 1) -> int:
+        """
+        Perform n_clusters Wolff updates.
+        
+        Returns total number of flipped spins.
+        """
+        total_flipped = 0
+        for _ in range(n_clusters):
+            total_flipped += self.wolff_step(T)
+        return total_flipped
+    
+    def equilibrate(self, T: float, n_sweeps: int = 1000, verbose: bool = False,
+                    use_wolff: bool = False):
         """
         Equilibrate the system at temperature T.
         
@@ -175,12 +229,17 @@ class IsingModel:
         T : float
             Target temperature
         n_sweeps : int
-            Number of Monte Carlo sweeps
+            Number of Monte Carlo sweeps (or Wolff clusters)
         verbose : bool
             Print progress
+        use_wolff : bool
+            Use Wolff cluster updates (much faster near Tc)
         """
         for sweep_idx in range(n_sweeps):
-            self.sweep(T)
+            if use_wolff:
+                self.wolff_step(T)
+            else:
+                self.sweep(T)
             if verbose and sweep_idx % 100 == 0:
                 m = abs(self.magnetization())
                 print(f"  Sweep {sweep_idx}: |m| = {m:.4f}")

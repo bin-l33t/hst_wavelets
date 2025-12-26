@@ -36,6 +36,7 @@ def generate_ising_signals(
     n_snapshots: int = 4,
     equilibration_sweeps: int = 2000,
     seed: int = 42,
+    use_wolff: bool = True,  # Use Wolff by default
 ) -> List[np.ndarray]:
     """
     Generate 1D signals from Ising model at temperature T.
@@ -47,15 +48,20 @@ def generate_ising_signals(
     signals = []
     
     for snap_idx in range(n_snapshots):
-        # Generate equilibrated snapshot
-        snapshot = model.generate_snapshot(T, equilibration_sweeps, verbose=False)
+        # Generate equilibrated snapshot (use Wolff near Tc)
+        # Hot/cold start
+        if T > TC_EXACT:
+            model.spins = model.rng.choice([-1, 1], size=(L, L))
+        else:
+            model.spins = np.ones((L, L), dtype=int)
+        
+        model.equilibrate(T, equilibration_sweeps, verbose=False, use_wolff=use_wolff)
+        snapshot = model.snapshot(T)
         
         # Extract each row as a 1D signal
-        # Shift spins from {-1, +1} to complex with offset to avoid origin
         for row_idx in range(L):
             row = snapshot.spins[row_idx, :].astype(float)
-            # Make complex and shift away from origin
-            signal = row + 0j + 3.0  # Shift by 3 so spins are at 2 or 4
+            signal = row + 0j + 3.0
             signals.append(signal)
     
     return signals
@@ -159,145 +165,161 @@ def analyze_regime(
 def test_ising_compactness():
     """
     Main test: compare HST compactness across Ising regimes.
+    Now with uncertainty bars from multiple seeds.
     """
     print("="*70)
     print("HST COMPACTNESS ON ISING MODEL")
     print("Testing regime-dependent multi-scale structure")
     print("="*70)
     
-    L = 32  # Smaller lattice for speed
+    L = 32  # Lattice size
     max_order = 2
-    n_snapshots = 2  # Fewer snapshots
-    equilibration_sweeps = 500  # Faster equilibration
+    n_snapshots = 2  # Per seed
+    equilibration_sweeps = 200  # Wolff is efficient
+    n_seeds = 10  # For uncertainty estimation
     
+    # Bump J for more paths
     hst = HeisenbergScatteringTransform(
-        L, J=2, Q=2, max_order=max_order,
+        L, J=3, Q=2, max_order=max_order,  # J=3 instead of J=2
         lifting='radial_floor', epsilon=1e-8
     )
     
+    # Get path counts
+    sample_output = hst.forward(np.ones(L, dtype=complex) + 3.0, max_order=max_order)
+    path_counts = {m: len(sample_output.order(m)) for m in range(max_order + 1)}
+    
     print(f"\nParameters:")
     print(f"  Lattice size L = {L}")
-    print(f"  Signals per regime: {n_snapshots} snapshots × {L} rows = {n_snapshots * L}")
-    print(f"  HST max_order = {max_order}")
+    print(f"  Signals per seed: {n_snapshots} snapshots × {L} rows = {n_snapshots * L}")
+    print(f"  Number of seeds: {n_seeds}")
+    print(f"  HST: J=3, Q=2, max_order={max_order}")
+    print(f"  Path counts: {path_counts}")
     print(f"  Critical temperature Tc = {TC_EXACT:.4f}")
+    print(f"  Using Wolff cluster updates for equilibration")
     
     # Temperature regimes
     regimes = [
-        (1.5, "ORDERED (T=1.5)"),
-        (2.0, "LOW (T=2.0)"),
-        (TC_EXACT, "CRITICAL (T≈2.27)"),
-        (2.5, "HIGH (T=2.5)"),
-        (3.5, "DISORDERED (T=3.5)"),
+        (1.5, "ORDERED"),
+        (2.0, "LOW"),
+        (TC_EXACT, "CRITICAL"),
+        (2.5, "HIGH"),
+        (3.5, "DISORDERED"),
     ]
     
-    all_results = []
+    # Collect results across seeds
+    all_regime_results = {name: {'d_eff': {m: [] for m in range(max_order+1)},
+                                  'top8': {m: [] for m in range(max_order+1)},
+                                  'k90': {m: [] for m in range(max_order+1)}}
+                          for _, name in regimes}
     
     print("\n" + "="*70)
-    print("GENERATING ISING SIGNALS...")
+    print(f"RUNNING {n_seeds} SEEDS PER REGIME...")
     print("="*70)
     
-    for T, regime_name in regimes:
-        print(f"\n  {regime_name}: ", end="", flush=True)
+    for seed_idx in range(n_seeds):
+        print(f"\n  Seed {seed_idx+1}/{n_seeds}: ", end="", flush=True)
         
-        signals = generate_ising_signals(
-            L=L, T=T, n_snapshots=n_snapshots,
-            equilibration_sweeps=equilibration_sweeps,
-            seed=42 + int(T * 100),
-        )
-        
-        print(f"generated {len(signals)} signals, analyzing...", end="", flush=True)
-        
-        results = analyze_regime(hst, signals, max_order, regime_name)
-        results['T'] = T
-        all_results.append(results)
+        for T, regime_name in regimes:
+            base_seed = 1000 * seed_idx + int(T * 100)
+            
+            signals = generate_ising_signals(
+                L=L, T=T, n_snapshots=n_snapshots,
+                equilibration_sweeps=equilibration_sweeps,
+                seed=base_seed, use_wolff=True,
+            )
+            
+            # Compute metrics for this seed
+            d_effs = {m: [] for m in range(max_order + 1)}
+            top8s = {m: [] for m in range(max_order + 1)}
+            k90s = {m: [] for m in range(max_order + 1)}
+            
+            for x in signals:
+                energies_by_order = compute_path_energies(hst, x, max_order)
+                for m in range(max_order + 1):
+                    d_effs[m].append(effective_dimension(energies_by_order[m]))
+                    top8s[m].append(top_k_fraction(energies_by_order[m], 8))
+                    k90s[m].append(k_for_fraction(energies_by_order[m], 0.9))
+            
+            # Store mean for this seed
+            for m in range(max_order + 1):
+                all_regime_results[regime_name]['d_eff'][m].append(np.mean(d_effs[m]))
+                all_regime_results[regime_name]['top8'][m].append(np.mean(top8s[m]))
+                all_regime_results[regime_name]['k90'][m].append(np.mean(k90s[m]))
+            
+            print(f"{regime_name[0]}", end="", flush=True)
         
         print(" done")
     
-    # Report results
+    # Compute mean ± stderr
     print("\n" + "="*70)
-    print("COMPACTNESS BY REGIME")
+    print("RESULTS WITH UNCERTAINTY (mean ± stderr)")
     print("="*70)
     
-    path_counts = all_results[0]['path_counts']
-    
     # Effective dimension table
-    print(f"\n  EFFECTIVE DIMENSION (d_eff)")
-    print(f"  Lower d_eff = more compact")
-    print(f"\n  {'Regime':<25}", end="")
-    for m in range(max_order + 1):
-        print(f" {'Order '+str(m):<12}", end="")
+    print(f"\n  EFFECTIVE DIMENSION (d_eff / #paths)")
+    print(f"  Lower = more compact. Critical should be lowest if hypothesis holds.")
+    print(f"\n  {'Regime':<15}", end="")
+    for m in range(1, max_order + 1):
+        print(f" {'Order '+str(m)+f' (n={path_counts[m]})':<25}", end="")
     print()
-    print(f"  {'#Paths:':<25}", end="")
-    for m in range(max_order + 1):
-        print(f" {path_counts[m]:<12}", end="")
-    print()
-    print(f"  {'-'*60}")
+    print(f"  {'-'*70}")
     
-    for results in all_results:
-        print(f"  {results['regime']:<25}", end="")
-        for m in range(max_order + 1):
-            d_eff = results[f'd_eff_{m}']
-            ratio = d_eff / path_counts[m] if path_counts[m] > 0 else 0
-            print(f" {d_eff:>5.1f} ({ratio:.0%})", end="")
+    for T, regime_name in regimes:
+        print(f"  {regime_name:<15}", end="")
+        for m in range(1, max_order + 1):
+            vals = all_regime_results[regime_name]['d_eff'][m]
+            mean = np.mean(vals)
+            stderr = np.std(vals) / np.sqrt(len(vals))
+            ratio = mean / path_counts[m]
+            print(f" {ratio:.3f} ± {stderr/path_counts[m]:.3f}", end="")
+            print(f" ({mean:.1f}±{stderr:.1f})", end="")
         print()
     
     # Top-8 table
     print(f"\n  TOP-8 ENERGY FRACTION")
     print(f"  Higher = more concentrated")
-    print(f"\n  {'Regime':<25}", end="")
-    for m in range(max_order + 1):
-        print(f" {'Order '+str(m):<12}", end="")
+    print(f"\n  {'Regime':<15}", end="")
+    for m in range(1, max_order + 1):
+        print(f" {'Order '+str(m):<20}", end="")
     print()
-    print(f"  {'-'*60}")
+    print(f"  {'-'*55}")
     
-    for results in all_results:
-        print(f"  {results['regime']:<25}", end="")
-        for m in range(max_order + 1):
-            top8 = results[f'top8_{m}']
-            print(f" {top8:<12.4f}", end="")
+    for T, regime_name in regimes:
+        print(f"  {regime_name:<15}", end="")
+        for m in range(1, max_order + 1):
+            vals = all_regime_results[regime_name]['top8'][m]
+            mean = np.mean(vals)
+            stderr = np.std(vals) / np.sqrt(len(vals))
+            print(f" {mean:.4f} ± {stderr:.4f}   ", end="")
         print()
     
-    # K90 table
-    print(f"\n  K FOR 90% ENERGY")
-    print(f"  Lower K = more compressible")
-    print(f"\n  {'Regime':<25}", end="")
-    for m in range(max_order + 1):
-        print(f" {'Order '+str(m):<12}", end="")
-    print()
-    print(f"  {'-'*60}")
-    
-    for results in all_results:
-        print(f"  {results['regime']:<25}", end="")
-        for m in range(max_order + 1):
-            k90 = results[f'k90_{m}']
-            print(f" {k90:<12.1f}", end="")
-        print()
-    
-    # Analysis: look for regime effects
+    # Statistical comparison: Critical vs others
     print("\n" + "="*70)
-    print("REGIME ANALYSIS")
+    print("STATISTICAL COMPARISON: CRITICAL vs OTHER REGIMES")
     print("="*70)
     
-    # Compare critical to ordered/disordered
-    critical_idx = 2  # TC_EXACT
-    ordered_idx = 0   # T=1.5
-    disordered_idx = 4  # T=3.5
+    critical_d_eff = {m: all_regime_results['CRITICAL']['d_eff'][m] for m in range(max_order+1)}
     
     for m in [1, 2]:
-        print(f"\n  Order {m}:")
+        print(f"\n  Order {m} (d_eff):")
+        crit_vals = np.array(critical_d_eff[m])
+        crit_mean = np.mean(crit_vals)
         
-        d_eff_crit = all_results[critical_idx][f'd_eff_{m}']
-        d_eff_ord = all_results[ordered_idx][f'd_eff_{m}']
-        d_eff_dis = all_results[disordered_idx][f'd_eff_{m}']
-        
-        print(f"    d_eff - Ordered: {d_eff_ord:.1f}, Critical: {d_eff_crit:.1f}, Disordered: {d_eff_dis:.1f}")
-        
-        if d_eff_crit < d_eff_ord and d_eff_crit < d_eff_dis:
-            print(f"    → Critical regime shows HIGHEST compactness (lowest d_eff)")
-        elif d_eff_crit > d_eff_ord and d_eff_crit > d_eff_dis:
-            print(f"    → Critical regime shows LOWEST compactness (highest d_eff)")
-        else:
-            print(f"    → Mixed pattern across regimes")
+        for T, regime_name in regimes:
+            if regime_name == 'CRITICAL':
+                continue
+            other_vals = np.array(all_regime_results[regime_name]['d_eff'][m])
+            other_mean = np.mean(other_vals)
+            
+            # Simple t-test approximation
+            diff = crit_mean - other_mean
+            pooled_se = np.sqrt(np.var(crit_vals)/n_seeds + np.var(other_vals)/n_seeds)
+            t_stat = diff / pooled_se if pooled_se > 0 else 0
+            
+            direction = "LOWER" if diff < 0 else "HIGHER"
+            significance = "***" if abs(t_stat) > 3 else "**" if abs(t_stat) > 2 else "*" if abs(t_stat) > 1 else ""
+            
+            print(f"    CRITICAL vs {regime_name:<12}: {diff:+.2f} ({direction}) t={t_stat:.2f} {significance}")
     
     return True
 
@@ -305,6 +327,7 @@ def test_ising_compactness():
 def test_ising_magnetization_series():
     """
     Alternative test: time series of magnetization during MCMC.
+    With uncertainty bars.
     """
     print("\n" + "="*70)
     print("MAGNETIZATION TIME SERIES ANALYSIS")
@@ -313,6 +336,7 @@ def test_ising_magnetization_series():
     L = 16  # Small lattice
     n_sweeps = 512  # Signal length
     max_order = 2
+    n_seeds = 10
     
     hst = HeisenbergScatteringTransform(
         n_sweeps, J=3, Q=2, max_order=max_order,
@@ -321,6 +345,7 @@ def test_ising_magnetization_series():
     
     print(f"\n  Lattice: {L}×{L}")
     print(f"  Time series length: {n_sweeps} sweeps")
+    print(f"  Number of seeds: {n_seeds}")
     
     regimes = [
         (1.5, "ORDERED"),
@@ -328,33 +353,49 @@ def test_ising_magnetization_series():
         (3.5, "DISORDERED"),
     ]
     
-    print(f"\n  {'Regime':<20} {'d_eff(1)':<12} {'d_eff(2)':<12} {'Top8(1)':<12} {'Top8(2)':<12}")
-    print(f"  {'-'*70}")
+    # Collect across seeds
+    results = {name: {'d_eff_1': [], 'd_eff_2': [], 'top8_1': [], 'top8_2': []} 
+               for _, name in regimes}
+    
+    print(f"\n  Running {n_seeds} seeds...", end="", flush=True)
+    
+    for seed_idx in range(n_seeds):
+        for T, regime_name in regimes:
+            model = IsingModel(L=L, seed=seed_idx * 100 + int(T * 10))
+            
+            # Equilibrate with Wolff
+            model.equilibrate(T, n_sweeps=100, use_wolff=True)
+            
+            # Record magnetization time series (Metropolis for dynamics)
+            mag_series = []
+            for _ in range(n_sweeps):
+                model.sweep(T)
+                mag_series.append(model.magnetization())
+            
+            signal = np.array(mag_series) + 0j + 2.0
+            energies_by_order = compute_path_energies(hst, signal, max_order)
+            
+            results[regime_name]['d_eff_1'].append(effective_dimension(energies_by_order[1]))
+            results[regime_name]['d_eff_2'].append(effective_dimension(energies_by_order[2]))
+            results[regime_name]['top8_1'].append(top_k_fraction(energies_by_order[1], 8))
+            results[regime_name]['top8_2'].append(top_k_fraction(energies_by_order[2], 8))
+    
+    print(" done")
+    
+    print(f"\n  {'Regime':<15} {'d_eff(1)':<18} {'d_eff(2)':<18} {'Top8(1)':<18} {'Top8(2)':<18}")
+    print(f"  {'-'*85}")
     
     for T, regime_name in regimes:
-        model = IsingModel(L=L, seed=42)
+        d1 = results[regime_name]['d_eff_1']
+        d2 = results[regime_name]['d_eff_2']
+        t1 = results[regime_name]['top8_1']
+        t2 = results[regime_name]['top8_2']
         
-        # Equilibrate first (faster)
-        model.equilibrate(T, n_sweeps=200)
-        
-        # Record magnetization time series
-        mag_series = []
-        for _ in range(n_sweeps):
-            model.sweep(T)
-            mag_series.append(model.magnetization())
-        
-        # Convert to HST signal (shift to avoid origin)
-        signal = np.array(mag_series) + 0j + 2.0
-        
-        # Compute HST
-        energies_by_order = compute_path_energies(hst, signal, max_order)
-        
-        d_eff_1 = effective_dimension(energies_by_order[1])
-        d_eff_2 = effective_dimension(energies_by_order[2])
-        top8_1 = top_k_fraction(energies_by_order[1], 8)
-        top8_2 = top_k_fraction(energies_by_order[2], 8)
-        
-        print(f"  {regime_name:<20} {d_eff_1:<12.1f} {d_eff_2:<12.1f} {top8_1:<12.4f} {top8_2:<12.4f}")
+        print(f"  {regime_name:<15} "
+              f"{np.mean(d1):.1f}±{np.std(d1)/np.sqrt(n_seeds):.1f}      "
+              f"{np.mean(d2):.1f}±{np.std(d2)/np.sqrt(n_seeds):.1f}      "
+              f"{np.mean(t1):.3f}±{np.std(t1)/np.sqrt(n_seeds):.3f}    "
+              f"{np.mean(t2):.3f}±{np.std(t2)/np.sqrt(n_seeds):.3f}")
     
     return True
 
