@@ -66,33 +66,10 @@ def compute_loss_and_grad_order1(
     """
     Compute Order-1 loss and analytic gradient.
     
-    Parameters
-    ----------
-    x : ndarray, shape (T,), complex
-        Input signal
-    hst : HeisenbergScatteringTransform
-        HST instance (provides filters, R mapping, lifting)
-    target_coeffs : dict
-        Target coefficients {(j,): W_target[j]} for Order-1 paths
-    weights : dict, optional
-        Per-order weights {order: weight}. Default: {1: 1.0}
-    loss_type : str
-        'l2' for standard L2 loss, 'phase_robust' for circular phase distance
-    phase_lambda : float
-        Weight on phase term in phase_robust loss (default 1.0)
-        
-    Returns
-    -------
-    loss : float
-        L2 loss on Order-1 coefficients
-    grad_x : ndarray, shape (T,), complex
-        Gradient of loss w.r.t. x
+    DEPRECATED: Use compute_loss_and_grad() for new code.
+    This function is kept for backward compatibility.
     """
-    # Delegate to Order 2 with no Order 2 targets
-    return compute_loss_and_grad_order2(
-        x, hst, target_coeffs, weights, 
-        loss_type=loss_type, phase_lambda=phase_lambda
-    )
+    return compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
 
 
 def _compute_phase_robust_loss_and_grad(
@@ -178,7 +155,11 @@ def _compute_l2_loss_and_grad(
     return float(loss), grad_W
 
 
-def compute_loss_and_grad_order2(
+# =============================================================================
+# Generic Arbitrary-Order Loss and Gradient Computation
+# =============================================================================
+
+def compute_loss_and_grad(
     x: np.ndarray,
     hst,
     target_coeffs: Dict[tuple, np.ndarray],
@@ -187,13 +168,11 @@ def compute_loss_and_grad_order2(
     phase_lambda: float = 1.0,
 ) -> Tuple[float, np.ndarray]:
     """
-    Compute Order-1 and Order-2 loss with analytic gradient.
+    Compute loss and analytic gradient for arbitrary scattering order.
     
-    Backpropagation through the full scattering tree:
-    
-        x → U1[j] → W1[j] → U2[j,k] → W2[j,k]
-        
-    The gradient computation handles "fan-out": one W1[j] feeds multiple W2[j,k].
+    This function dynamically builds the scattering tree to the maximum
+    order required by target_coeffs, then backpropagates gradients through
+    the entire tree structure.
     
     Parameters
     ----------
@@ -202,14 +181,13 @@ def compute_loss_and_grad_order2(
     hst : HeisenbergScatteringTransform
         HST instance
     target_coeffs : dict
-        Target coefficients for any combination of paths:
-        {(): S0, (j,): W1[j], (j,k): W2[j,k]}
+        Target coefficients for any paths: {path: W_target}
+        where path is a tuple like (), (j1,), (j1, j2), (j1, j2, j3), etc.
     weights : dict, optional
         Per-order weights {order: weight}. Default: all 1.0
     loss_type : str
         'l2': Standard |W - W_target|² loss
         'phase_robust': Circular phase distance + log-magnitude L2
-                        L = |ρ - ρ_t|² + λ|exp(iθ) - exp(iθ_t)|²
     phase_lambda : float
         Weight on phase term for phase_robust loss (default 1.0)
         
@@ -222,59 +200,11 @@ def compute_loss_and_grad_order2(
     """
     T = len(x)
     
+    # Determine maximum order needed from target_coeffs
+    max_order_needed = max((len(path) for path in target_coeffs), default=0)
+    
     if weights is None:
-        weights = {0: 1.0, 1: 1.0, 2: 1.0}
-    
-    # =========================================================================
-    # FORWARD PASS - Cache all intermediate values
-    # =========================================================================
-    
-    # Lift input signal
-    x_lifted, input_meta = hst._lift(x)
-    x_hat = np.fft.fft(x_lifted)
-    
-    # --- Order 0: Father wavelet (no R) ---
-    father_idx = -1
-    S0_hat = x_hat * hst.filters[father_idx]
-    S0 = np.fft.ifft(S0_hat)
-    
-    # --- Order 1: U1[j] = x * ψj, W1[j] = R(U1[j]) ---
-    U1 = {}           # Before R
-    U1_lifted = {}    # After lifting
-    W1 = {}           # After R
-    lift_meta_1 = {}  # Lifting metadata
-    
-    for j in range(hst.n_mothers):
-        U1_hat = x_hat * hst.filters[j]
-        U1[j] = np.fft.ifft(U1_hat)
-        U1_lifted[j], lift_meta_1[j] = hst._lift(U1[j])
-        W1[j] = hst._R(U1_lifted[j])
-    
-    # --- Order 2: U2[j,k] = W1[j] * ψk, W2[j,k] = R(U2[j,k]) ---
-    U2 = {}           # Before R
-    U2_lifted = {}    # After lifting
-    W2 = {}           # After R
-    lift_meta_2 = {}  # Lifting metadata
-    W1_hat = {}       # Cache FFT of W1 for efficiency
-    
-    for j in range(hst.n_mothers):
-        W1_hat[j] = np.fft.fft(W1[j])
-        
-        for k in range(hst.n_mothers):
-            if k <= j:  # Constraint: k > j to avoid redundancy
-                continue
-            
-            path = (j, k)
-            U2_hat = W1_hat[j] * hst.filters[k]
-            U2[path] = np.fft.ifft(U2_hat)
-            U2_lifted[path], lift_meta_2[path] = hst._lift(U2[path])
-            W2[path] = hst._R(U2_lifted[path])
-    
-    # =========================================================================
-    # COMPUTE LOSS (and cache gradients w.r.t. W for backward pass)
-    # =========================================================================
-    
-    loss = 0.0
+        weights = {i: 1.0 for i in range(max_order_needed + 1)}
     
     # Select loss function
     if loss_type == 'l2':
@@ -284,91 +214,148 @@ def compute_loss_and_grad_order2(
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
     
-    # Cache gradients w.r.t W for each path (used in backward pass)
-    grad_W1_from_loss = {}
-    grad_W2_from_loss = {}
+    # =========================================================================
+    # FORWARD PASS - Build complete scattering tree
+    # =========================================================================
     
-    # Order 0 loss (always L2, no R mapping applied)
+    # Data structures to cache intermediate values
+    # W[path] = coefficient after R mapping
+    # U_lifted[path] = coefficient after lifting (before R)
+    # parent_W_hat[path] = FFT of parent's W (for convolution)
+    
+    W = {}           # After R mapping
+    U_lifted = {}    # Before R (after lifting)
+    
+    # Lift input signal
+    x_lifted, _ = hst._lift(x)
+    x_hat = np.fft.fft(x_lifted)
+    
+    # --- Order 0: Father wavelet (no R) ---
+    father_idx = -1
+    S0_hat = x_hat * hst.filters[father_idx]
+    S0 = np.fft.ifft(S0_hat)
+    W[()] = S0  # Store for consistency (though Order 0 has no R)
+    
+    # --- Order 1 ---
+    if max_order_needed >= 1:
+        for j1 in range(hst.n_mothers):
+            path = (j1,)
+            U1_hat = x_hat * hst.filters[j1]
+            U1 = np.fft.ifft(U1_hat)
+            U1_lifted_val, _ = hst._lift(U1)
+            U_lifted[path] = U1_lifted_val
+            W[path] = hst._R(U1_lifted_val)
+    
+    # --- Order 2+ (recursive) ---
+    for order in range(2, max_order_needed + 1):
+        # Get all paths of previous order
+        prev_paths = [p for p in W.keys() if len(p) == order - 1 and p != ()]
+        
+        for prev_path in prev_paths:
+            W_prev = W[prev_path]
+            W_prev_hat = np.fft.fft(W_prev)
+            j_prev = prev_path[-1]
+            
+            for j_new in range(hst.n_mothers):
+                if j_new <= j_prev:  # Monotone constraint: j_new > j_prev
+                    continue
+                
+                new_path = prev_path + (j_new,)
+                U_new_hat = W_prev_hat * hst.filters[j_new]
+                U_new = np.fft.ifft(U_new_hat)
+                U_new_lifted, _ = hst._lift(U_new)
+                U_lifted[new_path] = U_new_lifted
+                W[new_path] = hst._R(U_new_lifted)
+    
+    # =========================================================================
+    # COMPUTE LOSS (and cache gradients w.r.t. W)
+    # =========================================================================
+    
+    loss = 0.0
+    grad_W_from_loss = {}  # Gradients from loss for each path
+    
+    # Order 0 loss (always L2, no R mapping)
     if () in target_coeffs:
         w0 = weights.get(0, 1.0)
         diff0 = S0 - target_coeffs[()]
         loss += w0 * np.sum(np.abs(diff0)**2).real
     
-    # Order 1 loss
-    w1 = weights.get(1, 1.0)
-    for j in range(hst.n_mothers):
-        path = (j,)
-        if path in target_coeffs:
-            l, g = loss_fn(W1[j], target_coeffs[path], w1)
+    # Order 1+ loss
+    for path in target_coeffs:
+        if len(path) == 0:
+            continue  # Already handled Order 0
+        
+        order = len(path)
+        w = weights.get(order, 1.0)
+        
+        if path in W:
+            l, g = loss_fn(W[path], target_coeffs[path], w)
             loss += l
-            grad_W1_from_loss[j] = g
-    
-    # Order 2 loss
-    w2 = weights.get(2, 1.0)
-    for path in W2:
-        if path in target_coeffs:
-            l, g = loss_fn(W2[path], target_coeffs[path], w2)
-            loss += l
-            grad_W2_from_loss[path] = g
+            grad_W_from_loss[path] = g
     
     # =========================================================================
-    # BACKWARD PASS
+    # BACKWARD PASS - Traverse tree in reverse order
     # =========================================================================
     
-    # Initialize gradient accumulators
+    # Gradient accumulators
+    # grad_W_accum[path] = accumulated gradient flowing back to W[path]
+    # from all its children in higher orders
+    grad_W_accum = {path: np.zeros(T, dtype=np.complex128) for path in W if path != ()}
+    
+    # Process orders from highest to lowest
+    for order in range(max_order_needed, 0, -1):
+        paths_at_order = [p for p in W.keys() if len(p) == order]
+        
+        for path in paths_at_order:
+            # Total gradient at W[path] = direct from loss + accumulated from children
+            grad_W_direct = grad_W_from_loss.get(path, np.zeros(T, dtype=np.complex128))
+            grad_W_total = grad_W_direct + grad_W_accum.get(path, np.zeros(T, dtype=np.complex128))
+            
+            # Backward through R: W = i·ln(U)
+            # dW/dU = i/U
+            dW_dU = 1j / U_lifted[path]
+            grad_U_lifted = grad_W_total * np.conj(dW_dU)
+            
+            # Backward through lifting (additive, gradient passes through)
+            grad_U = grad_U_lifted
+            
+            # Backward through convolution: U = W_parent * ψ_j
+            # grad_W_parent = grad_U ★ ψ_j (correlation)
+            j = path[-1]
+            grad_U_hat = np.fft.fft(grad_U)
+            grad_parent_hat = grad_U_hat * np.conj(hst.filters[j])
+            grad_parent = np.fft.ifft(grad_parent_hat)
+            
+            # Accumulate into parent's gradient
+            if order == 1:
+                # Parent is x, accumulate to grad_x
+                # We'll handle this after the loop
+                pass
+            else:
+                parent_path = path[:-1]
+                grad_W_accum[parent_path] += grad_parent
+    
+    # --- Collect Order 1 gradients into grad_x ---
     grad_x_hat = np.zeros(T, dtype=np.complex128)
     
-    # Accumulator for gradients flowing back to W1 from Order 2
-    # One W1[j] feeds multiple W2[j,k], so we accumulate
-    grad_W1_accum = {j: np.zeros(T, dtype=np.complex128) for j in range(hst.n_mothers)}
-    
-    # --- Layer 2 Backward ---
-    for path in W2:
-        if path not in grad_W2_from_loss:
+    for j1 in range(hst.n_mothers):
+        path = (j1,)
+        if path not in W:
             continue
         
-        j, k = path
+        grad_W_direct = grad_W_from_loss.get(path, np.zeros(T, dtype=np.complex128))
+        grad_W_total = grad_W_direct + grad_W_accum.get(path, np.zeros(T, dtype=np.complex128))
         
-        # Gradient w.r.t W2[j,k] from loss
-        grad_W2 = grad_W2_from_loss[path]
+        # Backward through R
+        dW_dU = 1j / U_lifted[path]
+        grad_U_lifted = grad_W_total * np.conj(dW_dU)
+        grad_U = grad_U_lifted
         
-        # Backward through R2: W2 = i·ln(U2)
-        # dW/dU = i/U, grad_U = grad_W * conj(i/U)
-        dW2_dU2 = 1j / U2_lifted[path]
-        grad_U2_lifted = grad_W2 * np.conj(dW2_dU2)
-        
-        # Backward through lifting (additive, gradient passes through)
-        grad_U2 = grad_U2_lifted
-        
-        # Backward through Filter 2: U2 = W1[j] * ψk
-        # grad_W1_contrib = grad_U2 ★ ψk (correlation = conv with conj)
-        grad_U2_hat = np.fft.fft(grad_U2)
-        grad_W1_contrib_hat = grad_U2_hat * np.conj(hst.filters[k])
-        grad_W1_contrib = np.fft.ifft(grad_W1_contrib_hat)
-        
-        # Accumulate into W1[j]'s gradient buffer
-        grad_W1_accum[j] += grad_W1_contrib
+        # Backward through filter
+        grad_U_hat = np.fft.fft(grad_U)
+        grad_x_hat += grad_U_hat * np.conj(hst.filters[j1])
     
-    # --- Layer 1 Backward ---
-    for j in range(hst.n_mothers):
-        # Direct gradient from Order 1 loss (if target exists)
-        grad_W1_direct = grad_W1_from_loss.get(j, np.zeros(T, dtype=np.complex128))
-        
-        # Total gradient at W1[j] = direct + accumulated from Order 2
-        grad_W1_total = grad_W1_direct + grad_W1_accum[j]
-        
-        # Backward through R1: W1 = i·ln(U1)
-        dW1_dU1 = 1j / U1_lifted[j]
-        grad_U1_lifted = grad_W1_total * np.conj(dW1_dU1)
-        
-        # Backward through lifting
-        grad_U1 = grad_U1_lifted
-        
-        # Backward through Filter 1: U1 = x * ψj
-        grad_U1_hat = np.fft.fft(grad_U1)
-        grad_x_hat += grad_U1_hat * np.conj(hst.filters[j])
-    
-    # --- Order 0 Backward (no R, always L2) ---
+    # --- Order 0 backward (no R) ---
     if () in target_coeffs:
         w0 = weights.get(0, 1.0)
         diff0 = S0 - target_coeffs[()]
@@ -377,12 +364,31 @@ def compute_loss_and_grad_order2(
         grad_x_hat += grad_S0_hat * np.conj(hst.filters[father_idx])
     
     # Convert to time domain
-    grad_x_lifted = np.fft.ifft(grad_x_hat)
-    
-    # Backward through input lifting (additive)
-    grad_x = grad_x_lifted
+    grad_x = np.fft.ifft(grad_x_hat)
     
     return float(loss), grad_x
+
+
+# =============================================================================
+# Order-Specific Wrappers (Backward Compatibility)
+# =============================================================================
+
+
+def compute_loss_and_grad_order2(
+    x: np.ndarray,
+    hst,
+    target_coeffs: Dict[tuple, np.ndarray],
+    weights: Optional[Dict[int, float]] = None,
+    loss_type: str = 'l2',
+    phase_lambda: float = 1.0,
+) -> Tuple[float, np.ndarray]:
+    """
+    Compute Order-1 and Order-2 loss with analytic gradient.
+    
+    DEPRECATED: Use compute_loss_and_grad() for new code.
+    This function is kept for backward compatibility.
+    """
+    return compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
 
 
 def compute_loss_only(
@@ -394,7 +400,7 @@ def compute_loss_only(
     phase_lambda: float = 1.0,
 ) -> float:
     """Compute loss without gradient (for finite difference testing)."""
-    loss, _ = compute_loss_and_grad_order2(x, hst, target_coeffs, weights, loss_type, phase_lambda)
+    loss, _ = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
     return loss
 
 
@@ -496,7 +502,7 @@ def optimize_signal(
     grad_norm_history = []
     
     for step in range(n_steps):
-        loss, grad = compute_loss_and_grad_order2(x, hst, target_coeffs, weights, loss_type, phase_lambda)
+        loss, grad = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
         
         grad_norm = np.linalg.norm(grad)
         loss_history.append(loss)
@@ -516,7 +522,7 @@ def optimize_signal(
         # This is handled by the lifting mechanism in the forward pass
     
     # Final loss
-    final_loss, _ = compute_loss_and_grad_order2(x, hst, target_coeffs, weights, loss_type, phase_lambda)
+    final_loss, _ = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
     loss_history.append(final_loss)
     
     if verbose:

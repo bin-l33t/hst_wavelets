@@ -237,7 +237,7 @@ class HeisenbergScatteringTransform:
         shift = meta.get('shift', 0.0)
         return z - shift
     
-    def forward(self, x: np.ndarray) -> ScatteringOutput:
+    def forward(self, x: np.ndarray, max_order: Optional[int] = None) -> ScatteringOutput:
         """
         Compute forward HST.
         
@@ -245,6 +245,9 @@ class HeisenbergScatteringTransform:
         ----------
         x : ndarray, shape (T,)
             Input signal (real or complex)
+        max_order : int, optional
+            Override the instance's max_order for this call.
+            Must be <= self.max_order. Default: use instance max_order.
             
         Returns
         -------
@@ -252,6 +255,16 @@ class HeisenbergScatteringTransform:
             Contains all scattering paths and coefficients
         """
         assert x.shape == (self.T,), f"Expected shape ({self.T},), got {x.shape}"
+        
+        # Determine effective max_order
+        if max_order is None:
+            effective_max_order = self.max_order
+        else:
+            if max_order > self.max_order:
+                raise ValueError(
+                    f"Requested max_order={max_order} exceeds instance max_order={self.max_order}"
+                )
+            effective_max_order = max_order
         
         paths = {}
         lift_meta = {}  # Store lifting metadata for each path
@@ -269,7 +282,7 @@ class HeisenbergScatteringTransform:
         raw_coeffs[()] = coeffs_all  # All coefficients at order 0
         
         # Order 1: First layer scattering
-        if self.max_order >= 1:
+        if effective_max_order >= 1:
             for j1 in range(self.n_mothers):
                 U1 = coeffs_all[j1]
                 # Lift and apply R
@@ -279,7 +292,7 @@ class HeisenbergScatteringTransform:
                 paths[(j1,)] = W1
         
         # Order 2: Second layer
-        if self.max_order >= 2:
+        if effective_max_order >= 2:
             for j1 in range(self.n_mothers):
                 W1 = paths[(j1,)]
                 coeffs_W1 = forward_transform(W1, self.filters)
@@ -295,8 +308,8 @@ class HeisenbergScatteringTransform:
                     paths[(j1, j2)] = W2
         
         # Order 3+: Recursive
-        if self.max_order >= 3:
-            for order in range(3, self.max_order + 1):
+        if effective_max_order >= 3:
+            for order in range(3, effective_max_order + 1):
                 prev_paths = {k: v for k, v in paths.items() if len(k) == order - 1}
                 
                 for prev_path, W_prev in prev_paths.items():
