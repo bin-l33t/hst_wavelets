@@ -266,7 +266,8 @@ class HeisenbergScatteringTransform:
         shift = meta.get('shift', 0.0)
         return z - shift
     
-    def forward(self, x: np.ndarray, max_order: Optional[int] = None) -> ScatteringOutput:
+    def forward(self, x: np.ndarray, max_order: Optional[int] = None, 
+                return_pre_R: bool = False) -> ScatteringOutput:
         """
         Compute forward HST.
         
@@ -277,11 +278,15 @@ class HeisenbergScatteringTransform:
         max_order : int, optional
             Override the instance's max_order for this call.
             Must be <= self.max_order. Default: use instance max_order.
+        return_pre_R : bool, optional
+            If True, store pre-R wavelet coefficients (U) alongside post-R (W).
+            Useful for MST/WPH limit comparisons. Default: False.
             
         Returns
         -------
         output : ScatteringOutput
-            Contains all scattering paths and coefficients
+            Contains all scattering paths and coefficients.
+            If return_pre_R=True, also contains output._pre_R_coeffs dict.
         """
         assert x.shape == (self.T,), f"Expected shape ({self.T},), got {x.shape}"
         
@@ -297,6 +302,7 @@ class HeisenbergScatteringTransform:
         
         paths = {}
         lift_meta = {}  # Store lifting metadata for each path
+        pre_R_coeffs = {} if return_pre_R else None  # Store U (pre-R) coefficients
         
         # Lift input signal
         x_lifted, meta_input = self._lift(x)
@@ -314,6 +320,9 @@ class HeisenbergScatteringTransform:
         if effective_max_order >= 1:
             for j1 in range(self.n_mothers):
                 U1 = coeffs_all[j1]
+                # Store pre-R coefficient if requested
+                if return_pre_R:
+                    pre_R_coeffs[(j1,)] = U1.copy()
                 # Lift and apply R
                 U1_lifted, meta = self._lift(U1)
                 lift_meta[(j1,)] = meta
@@ -364,6 +373,8 @@ class HeisenbergScatteringTransform:
         output._lift_meta = lift_meta
         output._raw_coeffs = raw_coeffs
         output._input_meta = meta_input
+        if return_pre_R:
+            output._pre_R_coeffs = pre_R_coeffs
         
         return output
     
