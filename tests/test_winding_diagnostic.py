@@ -185,21 +185,21 @@ def test_winding_change_correlation():
     """
     Analyze whether winding changes correlate with small min_seg.
     
-    Hypothesis: If winding changes only when min_seg is small, it's topological.
-    If winding changes with large min_seg, it's numerical or branch-cut related.
+    NOTE: This uses endpoint-only min_seg, which can miss tunneling.
+    See test_winding_consistency() for homotopy-aware analysis.
     """
     print("\n" + "="*70)
-    print("TEST: WINDING CHANGE vs MIN_SEG CORRELATION")
+    print("TEST: WINDING CHANGE vs MIN_SEG CORRELATION (endpoint-only)")
     print("="*70)
     
     results = test_winding_tracking_during_optimization()
     
     print("\n" + "-"*70)
-    print("CORRELATION ANALYSIS")
+    print("CORRELATION ANALYSIS (endpoint min_seg only - may miss tunneling)")
     print("-"*70)
     
-    print(f"\n{'Case':<20} {'Changed':>8} {'Change Step':>12} {'min_seg@change':>15} {'Classification':>15}")
-    print("-" * 75)
+    print(f"\n{'Case':<20} {'Changed':>8} {'Change Step':>12} {'min_seg@change':>15} {'Classification':>18}")
+    print("-" * 80)
     
     for (k, loss_type), data in results.items():
         analysis = data['analysis']
@@ -211,33 +211,34 @@ def test_winding_change_correlation():
             step = analysis['change_step']
             min_seg = data['min_seg_history'][step]
             
-            # Classify the change
+            # Classify the change - but note this is endpoint-only
             if min_seg < 0.01:
                 classification = "TOPOLOGICAL"
             elif min_seg < 0.1:
                 classification = "MARGINAL"
             else:
-                classification = "ANOMALOUS"
+                classification = "TUNNELING*"  # Changed from "ANOMALOUS"
             
-            print(f"{case_name:<20} {changed:>8} {step:>12} {min_seg:>15.6f} {classification:>15}")
+            print(f"{case_name:<20} {changed:>8} {step:>12} {min_seg:>15.6f} {classification:>18}")
         else:
-            print(f"{case_name:<20} {changed:>8} {'N/A':>12} {'N/A':>15} {'STABLE':>15}")
+            print(f"{case_name:<20} {changed:>8} {'N/A':>12} {'N/A':>15} {'STABLE':>18}")
     
-    # Summary
-    anomalous_cases = [
+    # Summary - updated to reflect tunneling understanding
+    tunneling_cases = [
         (k, lt) for (k, lt), d in results.items()
         if d['analysis']['changed'] and d['analysis']['change_step'] is not None
         and d['min_seg_history'][d['analysis']['change_step']] > 0.1
     ]
     
-    if anomalous_cases:
-        print("\n⚠ ANOMALOUS CASES DETECTED:")
-        print("  Winding changed despite large min_seg distance.")
-        print("  This suggests numerical or branch-cut issues, not topological crossing.")
-        for k, lt in anomalous_cases:
+    if tunneling_cases:
+        print("\n* TUNNELING cases detected (large endpoint min_seg, but winding changed):")
+        print("  These are NOT bugs - the optimizer path tunnels through the origin")
+        print("  between iterates even when both endpoints are far from it.")
+        print("  Use homotopy-aware guard (topology_margin) to prevent.")
+        for k, lt in tunneling_cases:
             print(f"    - k={k}, loss={lt}")
     else:
-        print("\n✓ All winding changes correlate with small min_seg (topological)")
+        print("\n✓ All winding changes correlate with small endpoint min_seg")
     
     return results
 
