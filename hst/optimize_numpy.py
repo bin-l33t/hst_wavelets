@@ -235,6 +235,130 @@ def min_segment_distance_to_origin(x: np.ndarray, closed: bool = True) -> float:
     return min_dist
 
 
+def _compute_winding_inline(z: np.ndarray, high_precision: bool = True) -> float:
+    """
+    Compute the winding number of a complex signal around the origin.
+    
+    This is an inline version for use during optimization tracking.
+    Uses FP64 accumulation for numerical stability at high winding numbers.
+    
+    Parameters
+    ----------
+    z : ndarray, complex
+        Complex signal representing a (possibly open) curve
+    high_precision : bool
+        If True, use Kahan summation for better FP64 accuracy
+        
+    Returns
+    -------
+    winding : float
+        Winding number (integer for closed curves that don't cross origin)
+        
+    Notes
+    -----
+    The winding number W = (1/2π) ∮ d(arg z) counts how many times a
+    trajectory encircles the origin.
+    
+    For GPU compatibility: this function explicitly uses float64 for
+    accumulation even if input is float32, because summing many small
+    phase differences can accumulate significant error otherwise.
+    """
+    # Ensure FP64 for phase computation
+    z = np.asarray(z, dtype=np.complex128)
+    
+    # Compute phase of each point
+    phases = np.angle(z)  # Returns float64
+    
+    # Compute phase differences
+    dphases = np.diff(phases)
+    
+    # Unwrap: phase jumps > π should be adjusted
+    # This handles the branch cut at ±π
+    dphases = np.where(dphases > np.pi, dphases - 2*np.pi, dphases)
+    dphases = np.where(dphases < -np.pi, dphases + 2*np.pi, dphases)
+    
+    # Close the curve: add the phase change from last to first
+    final_dphase = phases[0] - phases[-1]
+    if final_dphase > np.pi:
+        final_dphase -= 2*np.pi
+    elif final_dphase < -np.pi:
+        final_dphase += 2*np.pi
+    
+    if high_precision:
+        # Kahan summation for better numerical accuracy
+        total = 0.0
+        compensation = 0.0
+        for dp in dphases:
+            y = dp - compensation
+            t = total + y
+            compensation = (t - total) - y
+            total = t
+        # Add final phase difference
+        y = final_dphase - compensation
+        total = total + y
+    else:
+        total = np.sum(dphases) + final_dphase
+    
+    winding = total / (2 * np.pi)
+    return float(winding)
+
+
+def compute_winding_number(z: np.ndarray) -> float:
+    """
+    Public API for winding number computation.
+    
+    Wrapper around _compute_winding_inline for external use.
+    """
+    return _compute_winding_inline(z, high_precision=True)
+
+
+def detect_winding_change(winding_history: List[float], tolerance: float = 0.3) -> dict:
+    """
+    Analyze winding history to detect when/if winding number changed.
+    
+    Parameters
+    ----------
+    winding_history : list of float
+        Winding numbers recorded at each optimization step
+    tolerance : float
+        Maximum deviation from integer before considering it "changed"
+        
+    Returns
+    -------
+    analysis : dict
+        - 'initial_winding': rounded winding at start
+        - 'final_winding': rounded winding at end
+        - 'changed': bool, whether integer winding changed
+        - 'change_step': step where change first detected (or None)
+        - 'max_deviation': maximum deviation from nearest integer
+        - 'fractional_history': list of deviations from nearest integer
+    """
+    if len(winding_history) == 0:
+        return {'changed': False, 'error': 'empty history'}
+    
+    initial = round(winding_history[0])
+    final = round(winding_history[-1])
+    
+    fractional = [w - round(w) for w in winding_history]
+    max_deviation = max(abs(f) for f in fractional)
+    
+    # Detect first step where rounded winding differs from initial
+    change_step = None
+    for i, w in enumerate(winding_history):
+        if round(w) != initial:
+            change_step = i
+            break
+    
+    return {
+        'initial_winding': initial,
+        'final_winding': final,
+        'changed': initial != final,
+        'change_step': change_step,
+        'max_deviation': max_deviation,
+        'fractional_history': fractional,
+    }
+
+
 def compute_loss_and_grad_order1(
     x: np.ndarray,
     hst,
@@ -749,6 +873,7 @@ def optimize_signal(
     grad_norm_history = []
     min_magnitude_history = []  # Track pointwise proximity to origin
     min_segment_dist_history = []  # Track segment proximity (better for topology)
+    winding_history = []  # Track winding number throughout optimization
     
     for step in range(n_steps):
         # Evaluate loss on the SCALED signal (preserves original objective)
@@ -773,6 +898,10 @@ def optimize_signal(
         min_magnitude_history.append(min_mag)
         min_segment_dist_history.append(min_seg_dist)
         
+        # Track winding number (use helper if available, else inline)
+        winding = _compute_winding_inline(x_eval)
+        winding_history.append(winding)
+        
         # Gradient clipping
         if grad_clip is not None and grad_norm > grad_clip:
             grad_y = grad_y * (grad_clip / grad_norm)
@@ -783,7 +912,7 @@ def optimize_signal(
         
         if verbose and step % max(1, n_steps // 10) == 0:
             print(f"  Step {step:4d}: loss = {loss:.6e}, |grad| = {grad_norm:.6e}, "
-                  f"min|x| = {min_mag:.4e}, min_seg = {min_seg_dist:.4e}")
+                  f"min|x| = {min_mag:.4e}, min_seg = {min_seg_dist:.4e}, W = {winding:.2f}")
         
         if callback is not None:
             callback(step, x_eval, loss, grad_x)
@@ -838,10 +967,12 @@ def optimize_signal(
     loss_history.append(final_loss)
     min_magnitude_history.append(np.min(np.abs(x_final)))
     min_segment_dist_history.append(min_segment_distance_to_origin(x_final, closed=True))
+    final_winding = _compute_winding_inline(x_final)
+    winding_history.append(final_winding)
     
     if verbose:
         print(f"  Final: loss = {final_loss:.6e}, min|x| = {min_magnitude_history[-1]:.4e}, "
-              f"min_seg = {min_segment_dist_history[-1]:.4e}")
+              f"min_seg = {min_segment_dist_history[-1]:.4e}, W = {final_winding:.2f}")
     
     converged = len(loss_history) > 1 and loss_history[-1] < loss_history[0] * 0.01
     
@@ -856,6 +987,7 @@ def optimize_signal(
     # Attach topology diagnostics as extra attributes
     result.min_magnitude_history = min_magnitude_history
     result.min_segment_dist_history = min_segment_dist_history
+    result.winding_history = winding_history
     
     return result
 
