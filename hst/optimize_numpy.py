@@ -274,6 +274,31 @@ def compute_loss_and_grad(
         Total loss
     grad_x : ndarray, shape (T,), complex
         Gradient of loss w.r.t. x
+        
+    Notes
+    -----
+    **Topology Preservation (Important for High Winding Signals)**
+    
+    For signals with high winding numbers (trajectories that encircle the
+    origin many times), use `loss_type='phase_robust'` instead of 'l2'.
+    
+    The L2 loss treats phase as a linear quantity, which can cause issues
+    at branch cuts (θ jumping from +π to -π). The phase_robust loss uses
+    circular distance |exp(iθ) - exp(iθ_t)|², which is 2π-periodic and
+    smooth across branch cuts.
+    
+    Additionally, use `lifting='radial_floor'` in the HST to preserve
+    the winding number (topology) of the signal. The 'shift' lifting mode
+    can destroy topology when epsilon > signal radius.
+    
+    Example for high-winding signals:
+    
+        hst = HeisenbergScatteringTransform(
+            T, J=4, Q=4, lifting='radial_floor', epsilon=1e-8
+        )
+        loss, grad = compute_loss_and_grad(
+            x, hst, targets, loss_type='phase_robust'
+        )
     """
     T = len(x)
     
