@@ -186,13 +186,37 @@ class HeisenbergScatteringTransform:
         Apply lifting to ensure signal stays away from log singularity.
         
         Returns lifted signal and metadata needed for unlifting.
+        
+        Lifting modes:
+        - 'none': No modification (dangerous near origin)
+        - 'shift': Translate by epsilon (z → z + eps). Simple but destroys topology.
+        - 'radial_floor': Clamp magnitude r̃ = sqrt(|z|² + eps²), preserve angle.
+                          This maintains winding number and topology.
+        - 'analytic': For real signals, create analytic signal then shift.
+        - 'adaptive': Shift only if min|z| < eps.
         """
         if self.lifting == 'none':
             return z, {}
         
         elif self.lifting == 'shift':
-            # Simple constant shift
+            # Simple constant shift - destroys topology/winding
             return z + self.epsilon, {'shift': self.epsilon}
+        
+        elif self.lifting == 'radial_floor':
+            # Radial floor: r̃ = sqrt(|z|² + eps²), angle unchanged
+            # This preserves winding number / topology
+            # z̃ = r̃ * exp(i*θ) = z * r̃/r = z * sqrt(1 + eps²/|z|²)
+            r = np.abs(z)
+            r_floor = np.sqrt(r**2 + self.epsilon**2)
+            
+            # For z ≈ 0, we need to handle the angle carefully
+            # When z → 0, z/|z| is undefined, so we use z * (r_floor/r) with safety
+            # Equivalently: z_lifted = z * r_floor / max(r, tiny)
+            tiny = 1e-300  # Avoid division by exactly zero
+            scale = r_floor / np.maximum(r, tiny)
+            z_lifted = z * scale
+            
+            return z_lifted, {'radial_floor': True, 'epsilon': self.epsilon}
         
         elif self.lifting == 'analytic':
             # For real signals, create analytic signal
@@ -230,6 +254,11 @@ class HeisenbergScatteringTransform:
     
     def _unlift(self, z: np.ndarray, meta: dict) -> np.ndarray:
         """Undo the lifting operation."""
+        if meta.get('radial_floor', False):
+            # Radial floor is not exactly invertible near 0
+            # But for signals that didn't hit 0, it's approximately identity
+            # We return z as-is since the transform was r → sqrt(r² + eps²) ≈ r for r >> eps
+            return z
         if meta.get('analytic', False):
             # For analytic signals, the original is the real part
             shift = meta.get('shift', 0.0)
