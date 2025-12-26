@@ -55,6 +55,83 @@ class OptimizationResult:
     converged: bool
 
 
+# =============================================================================
+# Energy Normalization Utilities
+# =============================================================================
+
+def normalize_energy(x: np.ndarray) -> Tuple[np.ndarray, float]:
+    """
+    Normalize signal to unit energy.
+    
+    Parameters
+    ----------
+    x : ndarray, complex
+        Input signal
+        
+    Returns
+    -------
+    x_unit : ndarray, complex
+        Normalized signal with ||x_unit||_2 = 1
+    scale : float
+        Original energy scale (||x||_2)
+        
+    Usage
+    -----
+    For topology-preserving optimization (radial_floor), normalizing
+    to unit energy ensures consistent gradient magnitudes regardless
+    of input scale. This prevents the ∂W/∂U = i/U gradient from
+    exploding or vanishing due to scaling artifacts.
+    """
+    energy = np.linalg.norm(x)
+    if energy < 1e-15:
+        return x.copy(), 1.0
+    x_unit = x / energy
+    return x_unit, float(energy)
+
+
+def denormalize_energy(x_unit: np.ndarray, scale: float) -> np.ndarray:
+    """
+    Restore signal to original energy scale.
+    
+    Parameters
+    ----------
+    x_unit : ndarray, complex
+        Unit-energy signal
+    scale : float
+        Energy scale to restore
+        
+    Returns
+    -------
+    x : ndarray, complex
+        Signal with ||x||_2 = scale
+    """
+    return x_unit * scale
+
+
+def demean(x: np.ndarray) -> Tuple[np.ndarray, complex]:
+    """
+    Remove DC component (mean) from signal.
+    
+    This is essential for proper energy analysis because:
+    - Order 0 captures DC, which dominates energy ratios
+    - "Super-convergence" claims should only apply to fluctuations
+    
+    Parameters
+    ----------
+    x : ndarray, complex
+        Input signal
+        
+    Returns
+    -------
+    x_zero_mean : ndarray, complex
+        Signal with mean = 0
+    dc : complex
+        Removed DC component
+    """
+    dc = np.mean(x)
+    return x - dc, dc
+
+
 def compute_loss_and_grad_order1(
     x: np.ndarray,
     hst,
@@ -460,6 +537,8 @@ def optimize_signal(
     callback: Optional[callable] = None,
     loss_type: str = 'l2',
     phase_lambda: float = 1.0,
+    grad_clip: Optional[float] = None,
+    normalize: bool = False,
 ) -> OptimizationResult:
     """
     Optimize signal to match target HST coefficients.
@@ -490,26 +569,53 @@ def optimize_signal(
         'l2' or 'phase_robust'
     phase_lambda : float
         Weight on phase term for phase_robust loss
+    grad_clip : float, optional
+        Maximum gradient norm. If provided, gradients are clipped.
+        Useful for signals with poor conditioning (e.g., radial_floor on
+        zero-mean signals).
+    normalize : bool
+        If True, optimize on unit-energy signal internally and restore
+        scale at the end. Improves conditioning for radial_floor lifting.
         
     Returns
     -------
     result : OptimizationResult
     """
     x = x0.copy().astype(np.complex128)
+    
+    # Optional energy normalization for better conditioning
+    if normalize:
+        x, original_scale = normalize_energy(x)
+    else:
+        original_scale = 1.0
+    
     velocity = np.zeros_like(x)
     
     loss_history = []
     grad_norm_history = []
     
+    # Compute initial signal energy for normalized logging
+    initial_energy = np.linalg.norm(x0)
+    
     for step in range(n_steps):
         loss, grad = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
         
         grad_norm = np.linalg.norm(grad)
+        signal_norm = np.linalg.norm(x)
+        
+        # Gradient clipping
+        if grad_clip is not None and grad_norm > grad_clip:
+            grad = grad * (grad_clip / grad_norm)
+            grad_norm = grad_clip
+        
         loss_history.append(loss)
         grad_norm_history.append(grad_norm)
         
         if verbose and step % max(1, n_steps // 10) == 0:
-            print(f"  Step {step:4d}: loss = {loss:.6e}, |grad| = {grad_norm:.6e}")
+            # Show normalized loss (per unit energy) for scale-invariant tracking
+            normalized_loss = loss / (signal_norm**2 + 1e-15)
+            print(f"  Step {step:4d}: loss = {loss:.6e}, "
+                  f"loss/||x||² = {normalized_loss:.6e}, |grad| = {grad_norm:.6e}")
         
         if callback is not None:
             callback(step, x, loss, grad)
@@ -524,6 +630,10 @@ def optimize_signal(
     # Final loss
     final_loss, _ = compute_loss_and_grad(x, hst, target_coeffs, weights, loss_type, phase_lambda)
     loss_history.append(final_loss)
+    
+    # Restore original scale if normalized
+    if normalize:
+        x = denormalize_energy(x, original_scale)
     
     if verbose:
         print(f"  Final: loss = {final_loss:.6e}")

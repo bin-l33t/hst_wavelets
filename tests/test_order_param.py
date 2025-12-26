@@ -242,29 +242,31 @@ def test_superconvergence_diagnostic():
     
     Glinsky claims rapid energy decay with order ("super-convergence").
     
-    CRITICAL FIX: Use Average Energy per Path to normalize for combinatorial
-    explosion (Order 3 has 56 paths vs Order 1's 8 paths).
+    CRITICAL FIXES:
+    1. Auto-demean signals to remove DC artifact (E(0) >> E(1) due to mean)
+    2. Use Average Energy per Path to normalize for path count explosion
+    3. Exclude Order 0 from ratios since DC is not part of the "expansion"
     
-    Metric: E_avg[m] = E_total[m] / N_paths[m]
+    Metric: E_avg[m] = E_total[m] / N_paths[m] for m >= 1
     """
     print("\n[TEST 5: SUPER-CONVERGENCE DIAGNOSTIC]")
     print("-" * 50)
-    print("  Measuring AVERAGE energy per path (normalized for path count)")
+    print("  Measuring AVERAGE energy per path (auto-demeaned, Order 0 excluded)")
     print("  (Glinsky claims rapid decay = 'super-convergence')")
     print()
     
     T = 256
     np.random.seed(42)
     
-    # Test signals of different types
-    test_signals = {}
+    # Test signals of different types (will be auto-demeaned)
+    test_signals_raw = {}
     
     # 1. Random complex signal
-    test_signals['Random'] = np.random.randn(T) + 1j * np.random.randn(T) + 3.0
+    test_signals_raw['Random'] = np.random.randn(T) + 1j * np.random.randn(T) + 3.0
     
     # 2. Chirp (frequency-sweeping signal)
     t = np.linspace(0, 1, T)
-    test_signals['Chirp'] = np.exp(1j * 2 * np.pi * (10 * t + 20 * t**2)) + 3.0
+    test_signals_raw['Chirp'] = np.exp(1j * 2 * np.pi * (10 * t + 20 * t**2)) + 3.0
     
     # 3. Van der Pol-like oscillator (limit cycle)
     mu = 1.0
@@ -276,38 +278,49 @@ def test_superconvergence_diagnostic():
     for i in range(1, T):
         x_vdp[i] = x_vdp[i-1] + dt * v_vdp[i-1]
         v_vdp[i] = v_vdp[i-1] + dt * (mu * (1 - x_vdp[i-1]**2) * v_vdp[i-1] - x_vdp[i-1])
-    test_signals['Van der Pol'] = x_vdp + 1j * v_vdp + 3.0
+    test_signals_raw['Van der Pol'] = x_vdp + 1j * v_vdp + 3.0
     
     # 4. Simple harmonic oscillator (integrable)
     omega0 = 2 * np.pi * 3 / T
-    test_signals['Harmonic'] = 2.0 * np.cos(omega0 * np.arange(T)) + 3.0 + 0j
+    test_signals_raw['Harmonic'] = 2.0 * np.cos(omega0 * np.arange(T)) + 3.0 + 0j
     
     # 5. Coupled oscillators
     x_coupled = np.zeros(T, dtype=complex)
     for k in range(1, 4):
         x_coupled += np.exp(1j * 2 * np.pi * k * np.arange(T) / T)
-    test_signals['Coupled'] = x_coupled + 3.0
+    test_signals_raw['Coupled'] = x_coupled + 3.0
     
-    hst = HeisenbergScatteringTransform(T, J=3, Q=2, max_order=3, lifting='shift', epsilon=2.0)
+    # AUTO-DEMEAN all signals to remove DC artifact
+    test_signals = {}
+    for name, sig in test_signals_raw.items():
+        test_signals[name] = sig - np.mean(sig)
+    
+    print("  [All signals auto-demeaned to remove DC artifact]")
+    print()
+    
+    # Use radial_floor for topology-preserving analysis
+    hst = HeisenbergScatteringTransform(T, J=3, Q=2, max_order=3, lifting='radial_floor', epsilon=1e-8)
     
     results = {}
     
     for name, signal in test_signals.items():
         output = hst.forward(signal)
         
-        # Count paths and compute energy by order
-        path_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-        energy_by_order = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
+        # Count paths and compute energy by order (EXCLUDE Order 0)
+        path_counts = {1: 0, 2: 0, 3: 0}
+        energy_by_order = {1: 0.0, 2: 0.0, 3: 0.0}
         
         for path, coeff in output.paths.items():
             order = len(path)
+            if order == 0:
+                continue  # Exclude Order 0 (DC)
             path_counts[order] += 1
             energy = np.sum(np.abs(coeff)**2).real
             energy_by_order[order] += energy
         
         # Compute AVERAGE energy per path
         avg_energy = {}
-        for order in range(4):
+        for order in [1, 2, 3]:
             if path_counts[order] > 0:
                 avg_energy[order] = energy_by_order[order] / path_counts[order]
             else:
@@ -321,33 +334,32 @@ def test_superconvergence_diagnostic():
     
     # Print path counts (same for all signals)
     sample_counts = results['Random']['path_counts']
-    print(f"  Path counts: Order 0={sample_counts[0]}, Order 1={sample_counts[1]}, "
+    print(f"  Path counts: Order 1={sample_counts[1]}, "
           f"Order 2={sample_counts[2]}, Order 3={sample_counts[3]}")
     print()
     
-    # Print average energy per path
-    print(f"  {'Signal':<15} {'Avg E(0)':>12} {'Avg E(1)':>12} {'Avg E(2)':>12} {'Avg E(3)':>12}")
-    print("  " + "-" * 63)
+    # Print average energy per path (Order 0 excluded)
+    print(f"  {'Signal':<15} {'Avg E(1)':>12} {'Avg E(2)':>12} {'Avg E(3)':>12}")
+    print("  " + "-" * 51)
     
     for name, data in results.items():
         avg = data['avg_energy']
-        print(f"  {name:<15} {avg[0]:>12.2e} {avg[1]:>12.2e} {avg[2]:>12.2e} {avg[3]:>12.2e}")
+        print(f"  {name:<15} {avg[1]:>12.2e} {avg[2]:>12.2e} {avg[3]:>12.2e}")
     
-    # Print ratios to see decay
+    # Print ratios to see decay (only E(2)/E(1) and E(3)/E(2))
     print()
-    print(f"  {'Signal':<15} {'E(1)/E(0)':>12} {'E(2)/E(1)':>12} {'E(3)/E(2)':>12}")
-    print("  " + "-" * 51)
+    print(f"  {'Signal':<15} {'E(2)/E(1)':>12} {'E(3)/E(2)':>12}")
+    print("  " + "-" * 39)
     
     decay_pattern_count = 0
     for name, data in results.items():
         avg = data['avg_energy']
-        r10 = avg[1] / avg[0] if avg[0] > 0 else 0
         r21 = avg[2] / avg[1] if avg[1] > 0 else 0
         r32 = avg[3] / avg[2] if avg[2] > 0 else 0
-        print(f"  {name:<15} {r10:>12.4f} {r21:>12.4f} {r32:>12.4f}")
+        print(f"  {name:<15} {r21:>12.4f} {r32:>12.4f}")
         
-        # Check if showing decay pattern (each ratio < 1)
-        if r10 < 1 and r21 < 1 and r32 < 1:
+        # Check if showing decay pattern (both ratios < 1)
+        if r21 < 1 and r32 < 1:
             decay_pattern_count += 1
     
     print()
