@@ -23,6 +23,7 @@ import numpy as np
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
+from scipy.stats import ttest_ind
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -269,7 +270,7 @@ def test_ising_compactness():
         for m in range(1, max_order + 1):
             vals = all_regime_results[regime_name]['d_eff'][m]
             mean = np.mean(vals)
-            stderr = np.std(vals) / np.sqrt(len(vals))
+            stderr = np.std(vals, ddof=1) / np.sqrt(len(vals))  # ddof=1 for sample std
             ratio = mean / path_counts[m]
             print(f" {ratio:.3f} ± {stderr/path_counts[m]:.3f}", end="")
             print(f" ({mean:.1f}±{stderr:.1f})", end="")
@@ -289,37 +290,45 @@ def test_ising_compactness():
         for m in range(1, max_order + 1):
             vals = all_regime_results[regime_name]['top8'][m]
             mean = np.mean(vals)
-            stderr = np.std(vals) / np.sqrt(len(vals))
+            stderr = np.std(vals, ddof=1) / np.sqrt(len(vals))
             print(f" {mean:.4f} ± {stderr:.4f}   ", end="")
         print()
     
-    # Statistical comparison: Critical vs others
+    # Statistical comparison: Critical vs others using Welch's t-test
     print("\n" + "="*70)
-    print("STATISTICAL COMPARISON: CRITICAL vs OTHER REGIMES")
+    print("STATISTICAL COMPARISON: CRITICAL vs OTHER REGIMES (Welch t-test)")
     print("="*70)
     
-    critical_d_eff = {m: all_regime_results['CRITICAL']['d_eff'][m] for m in range(max_order+1)}
+    critical_d_eff = {m: np.array(all_regime_results['CRITICAL']['d_eff'][m]) 
+                      for m in range(max_order+1)}
     
     for m in [1, 2]:
         print(f"\n  Order {m} (d_eff):")
-        crit_vals = np.array(critical_d_eff[m])
-        crit_mean = np.mean(crit_vals)
+        crit_vals = critical_d_eff[m]
         
         for T, regime_name in regimes:
             if regime_name == 'CRITICAL':
                 continue
             other_vals = np.array(all_regime_results[regime_name]['d_eff'][m])
-            other_mean = np.mean(other_vals)
             
-            # Simple t-test approximation
-            diff = crit_mean - other_mean
-            pooled_se = np.sqrt(np.var(crit_vals)/n_seeds + np.var(other_vals)/n_seeds)
-            t_stat = diff / pooled_se if pooled_se > 0 else 0
+            # Welch's t-test (unequal variance)
+            t_stat, p_value = ttest_ind(crit_vals, other_vals, equal_var=False)
             
+            diff = np.mean(crit_vals) - np.mean(other_vals)
             direction = "LOWER" if diff < 0 else "HIGHER"
-            significance = "***" if abs(t_stat) > 3 else "**" if abs(t_stat) > 2 else "*" if abs(t_stat) > 1 else ""
             
-            print(f"    CRITICAL vs {regime_name:<12}: {diff:+.2f} ({direction}) t={t_stat:.2f} {significance}")
+            # Significance stars based on actual p-value
+            if p_value < 0.001:
+                sig = "***"
+            elif p_value < 0.01:
+                sig = "**"
+            elif p_value < 0.05:
+                sig = "*"
+            else:
+                sig = ""
+            
+            print(f"    CRITICAL vs {regime_name:<12}: diff={diff:+.2f} ({direction}) "
+                  f"t={t_stat:.2f}, p={p_value:.2e} {sig}")
     
     return True
 
@@ -392,10 +401,10 @@ def test_ising_magnetization_series():
         t2 = results[regime_name]['top8_2']
         
         print(f"  {regime_name:<15} "
-              f"{np.mean(d1):.1f}±{np.std(d1)/np.sqrt(n_seeds):.1f}      "
-              f"{np.mean(d2):.1f}±{np.std(d2)/np.sqrt(n_seeds):.1f}      "
-              f"{np.mean(t1):.3f}±{np.std(t1)/np.sqrt(n_seeds):.3f}    "
-              f"{np.mean(t2):.3f}±{np.std(t2)/np.sqrt(n_seeds):.3f}")
+              f"{np.mean(d1):.1f}±{np.std(d1, ddof=1)/np.sqrt(n_seeds):.1f}      "
+              f"{np.mean(d2):.1f}±{np.std(d2, ddof=1)/np.sqrt(n_seeds):.1f}      "
+              f"{np.mean(t1):.3f}±{np.std(t1, ddof=1)/np.sqrt(n_seeds):.3f}    "
+              f"{np.mean(t2):.3f}±{np.std(t2, ddof=1)/np.sqrt(n_seeds):.3f}")
     
     return True
 
