@@ -18,4 +18,3 @@ __all__ = [
     'forward_transform_torch',
     'lowpass_torch',
 ]
-

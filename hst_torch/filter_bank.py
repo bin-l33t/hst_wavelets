@@ -1,7 +1,7 @@
 """
 PyTorch Filterbank for HST
 
-Mirrors the NumPy implementation in hst/filter_bank.py but uses torch operations.
+Mirrors the NumPy implementation in hst/filter_bank.py exactly.
 """
 
 import math
@@ -10,132 +10,118 @@ import torch
 from typing import Tuple, List, Dict, Optional
 
 
-def paul_wavelet_torch(
-    N: int,
-    scale: float,
-    order: int = 4,
-    device: torch.device = None,
-    dtype: torch.dtype = torch.complex128,
-) -> torch.Tensor:
-    """
-    Generate Paul wavelet in frequency domain (PyTorch).
-    
-    Parameters
-    ----------
-    N : int
-        Signal length
-    scale : float
-        Wavelet scale (center frequency ~ 1/scale)
-    order : int
-        Paul wavelet order (default 4)
-    device : torch.device
-        Target device
-    dtype : torch.dtype
-        Complex dtype
-        
-    Returns
-    -------
-    psi_hat : torch.Tensor
-        Wavelet in frequency domain, shape (N,)
-    """
-    if device is None:
-        device = torch.device('cpu')
-    
-    # Frequency axis (same convention as numpy fft)
-    k = torch.arange(N, device=device, dtype=torch.float64)
-    k[N//2 + 1:] = k[N//2 + 1:] - N
-    
-    # Normalized frequency
-    omega = 2 * np.pi * k / N
-    
-    # Paul wavelet in frequency domain (analytic, positive frequencies only)
-    # H(ω) * ω^m * exp(-ω) for ω > 0
-    m = order
-    
-    # Normalization constant
-    norm = (2 ** m) / np.sqrt(N * math.factorial(2 * m - 1))
-    
-    # Scaled frequency
-    w = scale * omega
-    
-    # Paul wavelet (only positive frequencies)
-    # Compute real values first, then convert to complex
-    psi_real = torch.zeros(N, device=device, dtype=torch.float64)
-    pos_mask = omega > 0
-    w_pos = w[pos_mask]
-    psi_real[pos_mask] = norm * (w_pos ** m) * torch.exp(-w_pos)
-    
-    # Convert to complex
-    psi_hat = psi_real.to(dtype)
-    
-    return psi_hat
-
-
 def two_channel_paul_filterbank_torch(
-    N: int,
+    T: int,
     J: int = 4,
     Q: int = 2,
-    order: int = 4,
+    m: int = 4,
     device: torch.device = None,
     dtype: torch.dtype = torch.complex128,
 ) -> Tuple[List[torch.Tensor], Dict]:
     """
-    Create Paul wavelet filterbank (PyTorch version).
+    Create a two-channel tight frame Paul wavelet filter bank (PyTorch version).
+    
+    This exactly mirrors the NumPy implementation in hst/filter_bank.py.
     
     Parameters
     ----------
-    N : int
+    T : int
         Signal length
     J : int
         Number of octaves
     Q : int
         Wavelets per octave
-    order : int
+    m : int
         Paul wavelet order
     device : torch.device
         Target device
     dtype : torch.dtype
-        Complex dtype
+        Complex dtype for output
         
     Returns
     -------
     filters : list of torch.Tensor
-        List of filters in frequency domain. Last one is lowpass (father).
+        List of filters in frequency domain
     info : dict
         Filter metadata
     """
     if device is None:
         device = torch.device('cpu')
     
-    filters = []
-    scales = []
+    # Frequency axis (same as np.fft.fftfreq)
+    k = torch.fft.fftfreq(T, device=device, dtype=torch.float64)
+    omega = k * 2 * np.pi
+    w = torch.abs(omega)
     
-    # Mother wavelets at dyadic scales with Q subdivisions
-    for j in range(J):
-        for q in range(Q):
-            scale = 2 ** (j + q / Q)
-            psi_hat = paul_wavelet_torch(N, scale, order, device, dtype)
-            filters.append(psi_hat)
-            scales.append(scale)
+    pos_mask = k > 0
+    neg_mask = k < 0
     
-    # Father wavelet (lowpass) - Gaussian
-    k = torch.arange(N, device=device, dtype=torch.float64)
-    k[N//2 + 1:] = k[N//2 + 1:] - N
-    omega = 2 * np.pi * k / N
+    num_mothers = J * Q
+    xi_max = np.pi
     
-    # Lowpass: Gaussian centered at 0
-    max_scale = 2 ** J
-    sigma = max_scale / (2 * np.pi)
-    phi_hat = torch.exp(-0.5 * (omega * sigma) ** 2).to(dtype)
-    filters.append(phi_hat)
+    lp_sum_sq = torch.zeros(T, device=device, dtype=torch.float64)
+    all_filters = []
+    
+    # H⁺ mothers (positive frequencies)
+    for j in range(num_mothers):
+        xi_j = xi_max * (2 ** (-j / Q))
+        s = m / xi_j
+        arg = s * w
+        
+        # Paul wavelet: (s·|ω|)^m · exp(-s·|ω|) = exp(m·log(arg) - arg)
+        psi = torch.zeros(T, device=device, dtype=torch.float64)
+        valid = pos_mask & (arg > 1e-10)
+        if valid.any():
+            psi[valid] = torch.exp(m * torch.log(arg[valid]) - arg[valid])
+        
+        all_filters.append(psi)
+        lp_sum_sq = lp_sum_sq + psi ** 2
+    
+    # H⁻ mothers (negative frequencies, mirror of H⁺)
+    for j in range(num_mothers):
+        xi_j = xi_max * (2 ** (-j / Q))
+        s = m / xi_j
+        arg = s * w
+        
+        psi = torch.zeros(T, device=device, dtype=torch.float64)
+        valid = neg_mask & (arg > 1e-10)
+        if valid.any():
+            psi[valid] = torch.exp(m * torch.log(arg[valid]) - arg[valid])
+        
+        all_filters.append(psi)
+        lp_sum_sq = lp_sum_sq + psi ** 2
+    
+    # Father wavelet (symmetric Gaussian, covers DC)
+    xi_min = xi_max * (2 ** (-(num_mothers - 1) / Q))
+    sigma_phi = xi_min
+    phi = torch.exp(-w**2 / (2 * sigma_phi**2))
+    all_filters.append(phi)
+    lp_sum_sq = lp_sum_sq + phi ** 2
+    
+    # Normalize for partition of unity
+    lp_sum = torch.sqrt(lp_sum_sq)
+    lp_sum = torch.maximum(lp_sum, torch.tensor(1e-10, device=device))
+    
+    # Normalize and convert to complex
+    filters = [(f / lp_sum).to(dtype) for f in all_filters]
+    
+    # Verify partition of unity
+    pou = sum(torch.abs(f)**2 for f in filters)
     
     info = {
-        'N': N,
+        'T': T,
         'J': J,
         'Q': Q,
-        'order': order,
-        'n_mothers': J * Q,
-        'scales': scales,
+        'm': m,
+        'n_pos_mothers': num_mothers,
+        'n_neg_mothers': num_mothers,
+        'n_father': 1,
+        'n_total': len(filters),
+        'n_mothers': 2 * num_mothers,  # For compatibility
+        'pou_min': float(pou.min().item()),
+        'pou_max': float(pou.max().item()),
+        'pou_ok': torch.allclose(pou, torch.ones_like(pou), atol=1e-6),
+        'backend': 'torch',
     }
     
     return filters, info
@@ -151,7 +137,7 @@ def forward_transform_torch(
     Parameters
     ----------
     x : torch.Tensor
-        Input signal, shape (N,) complex
+        Input signal, shape (T,) complex
     filters : list of torch.Tensor
         Filters in frequency domain
         

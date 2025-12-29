@@ -1,7 +1,7 @@
 """
 PyTorch Heisenberg Scattering Transform
 
-Mirrors the NumPy implementation in hst/scattering.py but uses torch operations.
+Mirrors the NumPy implementation in hst/scattering.py exactly.
 """
 
 import torch
@@ -27,19 +27,17 @@ class HSTOutputTorch:
         """Get all paths of a specific order."""
         return {p: c for p, c in self.paths.items() if len(p) == m}
     
-    def to_numpy(self) -> 'HSTOutputNumpy':
+    def to_numpy(self):
         """Convert to numpy arrays."""
-        from hst.scattering import HSTOutput
         np_paths = {p: c.cpu().numpy() for p, c in self.paths.items()}
-        return HSTOutput(paths=np_paths, T=self.T, max_order=self.max_order)
+        return np_paths
 
 
 class HeisenbergScatteringTransformTorch:
     """
     PyTorch implementation of Heisenberg Scattering Transform.
     
-    This is a forward-only implementation for inference.
-    Matches the NumPy version's output format for parity testing.
+    This mirrors the NumPy version's output format for parity testing.
     """
     
     def __init__(
@@ -67,7 +65,7 @@ class HeisenbergScatteringTransformTorch:
         max_order : int
             Maximum scattering order
         lifting : str
-            Lifting strategy ('radial_floor' or 'joukowsky')
+            Lifting strategy ('radial_floor' supported)
         epsilon : float
             Minimum distance from origin for lifting
         device : torch.device
@@ -87,75 +85,38 @@ class HeisenbergScatteringTransformTorch:
         self.device = device
         self.dtype = dtype
         
-        # Create filterbank
+        # Create filterbank (two-channel: H+ and H- mothers + father)
         self.filters, self.filter_info = two_channel_paul_filterbank_torch(
             T, J, Q, device=device, dtype=dtype
         )
-        self.n_mothers = self.filter_info['n_mothers']
-        self.phi_hat = self.filters[-1]  # Lowpass (father)
-        self.psi_hats = self.filters[:-1]  # Bandpass (mothers)
-    
+        
+        # Number of mother wavelets (H+ and H- combined)
+        self.n_mothers = self.filter_info['n_mothers']  # = 2 * J * Q
+        
     def _lift(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Lift signal away from origin.
+        Lift signal away from origin using radial floor.
         
-        Parameters
-        ----------
-        z : torch.Tensor
-            Complex signal
-            
-        Returns
-        -------
-        z_lifted : torch.Tensor
-            Signal with |z| >= epsilon
+        r̃ = sqrt(|z|² + eps²), angle unchanged
         """
         if self.lifting == 'radial_floor':
-            # Simple radial projection
             r = torch.abs(z)
-            # Where r < epsilon, scale up to epsilon
-            scale = torch.where(
-                r < self.epsilon,
-                self.epsilon / (r + 1e-16),
-                torch.ones_like(r)
-            )
+            r_floor = torch.sqrt(r**2 + self.epsilon**2)
+            tiny = 1e-300
+            scale = r_floor / torch.clamp(r, min=tiny)
             return z * scale
-        elif self.lifting == 'joukowsky':
-            # Joukowsky-style: z + epsilon²/z (pushes away from origin)
-            r = torch.abs(z)
-            safe_z = torch.where(
-                r < self.epsilon,
-                z + self.epsilon * torch.exp(1j * torch.angle(z)),
-                z
-            )
-            return safe_z
         else:
-            return z
+            # Simple shift fallback
+            return z + self.epsilon
     
     def _R(self, z: torch.Tensor) -> torch.Tensor:
         """
         Apply R = i * log activation.
         
         R(z) = i * ln(z) = i * (ln|z| + i*arg(z)) = -arg(z) + i*ln|z|
-        
-        Parameters
-        ----------
-        z : torch.Tensor
-            Complex signal (should be lifted away from origin)
-            
-        Returns
-        -------
-        w : torch.Tensor
-            Transformed signal
         """
-        # Lift first
-        z_lifted = self._lift(z)
-        
-        # R = i * log(z)
-        # log(z) = ln|z| + i*arg(z)
-        # i * log(z) = i*ln|z| - arg(z) = -arg(z) + i*ln|z|
-        ln_r = torch.log(torch.abs(z_lifted))
-        theta = torch.angle(z_lifted)
-        
+        ln_r = torch.log(torch.abs(z))
+        theta = torch.angle(z)
         return -theta + 1j * ln_r
     
     def forward(
@@ -189,70 +150,66 @@ class HeisenbergScatteringTransformTorch:
         
         paths = {}
         
-        # Order 0: lowpass of input
-        S0 = lowpass_torch(x, self.phi_hat)
-        paths[()] = S0
+        # Lift input signal
+        x_lifted = self._lift(x)
+        
+        # Order 0: All filter outputs
+        coeffs_all = forward_transform_torch(x_lifted, self.filters)
+        paths[()] = coeffs_all[-1]  # Father coefficient (lowpass)
         
         if max_order == 0:
             return HSTOutputTorch(paths=paths, T=self.T, max_order=max_order)
         
-        # Order 1: wavelet transform + R + lowpass
-        U1 = {}  # Store for higher orders
+        # Order 1: Apply R to each mother wavelet output
+        W1_dict = {}  # Store for order 2
         
-        for j, psi_hat in enumerate(self.psi_hats):
-            # Wavelet modulation
-            x_hat = torch.fft.fft(x)
-            W_x = torch.fft.ifft(x_hat * psi_hat)
-            
-            # Apply R activation
-            R_W = self._R(W_x)
-            
-            # Store for recursion
-            U1[j] = R_W
-            
-            # Lowpass for output
-            S1 = lowpass_torch(R_W, self.phi_hat)
-            paths[(j,)] = S1
+        for j1 in range(self.n_mothers):
+            U1 = coeffs_all[j1]
+            U1_lifted = self._lift(U1)
+            W1 = self._R(U1_lifted)
+            paths[(j1,)] = W1
+            W1_dict[j1] = W1
         
         if max_order == 1:
             return HSTOutputTorch(paths=paths, T=self.T, max_order=max_order)
         
-        # Order 2: cascade
-        U2 = {}
+        # Order 2: Cascade from each W1
+        W2_dict = {}
         
-        for j1, R1 in U1.items():
-            for j2, psi_hat in enumerate(self.psi_hats):
+        for j1 in range(self.n_mothers):
+            W1 = W1_dict[j1]
+            coeffs_W1 = forward_transform_torch(W1, self.filters)
+            
+            for j2 in range(self.n_mothers):
                 if j2 <= j1:
                     continue  # Frequency ordering constraint
                 
-                # Wavelet of R1
-                R1_hat = torch.fft.fft(R1)
-                W_R1 = torch.fft.ifft(R1_hat * psi_hat)
-                
-                # Apply R activation
-                R_W_R1 = self._R(W_R1)
-                
-                # Store for order 3
-                U2[(j1, j2)] = R_W_R1
-                
-                # Lowpass for output
-                S2 = lowpass_torch(R_W_R1, self.phi_hat)
-                paths[(j1, j2)] = S2
+                U2 = coeffs_W1[j2]
+                U2_lifted = self._lift(U2)
+                W2 = self._R(U2_lifted)
+                paths[(j1, j2)] = W2
+                W2_dict[(j1, j2)] = W2
         
         if max_order == 2:
             return HSTOutputTorch(paths=paths, T=self.T, max_order=max_order)
         
-        # Order 3
-        for (j1, j2), R2 in U2.items():
-            for j3, psi_hat in enumerate(self.psi_hats):
-                if j3 <= j2:
-                    continue
+        # Order 3+: Recursive
+        for order in range(3, max_order + 1):
+            prev_paths = {k: v for k, v in paths.items() if len(k) == order - 1}
+            
+            for prev_path, W_prev in prev_paths.items():
+                coeffs_prev = forward_transform_torch(W_prev, self.filters)
+                j_prev = prev_path[-1]
                 
-                R2_hat = torch.fft.fft(R2)
-                W_R2 = torch.fft.ifft(R2_hat * psi_hat)
-                R_W_R2 = self._R(W_R2)
-                S3 = lowpass_torch(R_W_R2, self.phi_hat)
-                paths[(j1, j2, j3)] = S3
+                for j_new in range(self.n_mothers):
+                    if j_new <= j_prev:
+                        continue
+                    
+                    U_new = coeffs_prev[j_new]
+                    U_new_lifted = self._lift(U_new)
+                    W_new = self._R(U_new_lifted)
+                    new_path = prev_path + (j_new,)
+                    paths[new_path] = W_new
         
         return HSTOutputTorch(paths=paths, T=self.T, max_order=min(max_order, 3))
     
@@ -260,6 +217,4 @@ class HeisenbergScatteringTransformTorch:
         """Move filterbank to device."""
         self.device = device
         self.filters = [f.to(device) for f in self.filters]
-        self.phi_hat = self.filters[-1]
-        self.psi_hats = self.filters[:-1]
         return self
