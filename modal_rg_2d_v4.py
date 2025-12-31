@@ -180,7 +180,13 @@ def run_rg_experiment_v4(
         L_pool = L // pool_size
         pooled = s_residual.reshape(N, L_pool, pool_size, L_pool, pool_size).mean(axis=(2, 4))
         
-        return pooled.reshape(N, -1)
+        features = pooled.reshape(N, -1)
+        
+        # Add small noise to prevent zero variance (for numerical stability)
+        # This is a tiny perturbation that won't affect results but prevents NaN
+        features = features + np.random.randn(*features.shape) * 1e-10
+        
+        return features
     
     def extract_scattering_small_scales(snapshots, b):
         """
@@ -288,6 +294,16 @@ def run_rg_experiment_v4(
         # Handle NaN/Inf
         X_train_s = np.nan_to_num(X_train_s, nan=0, posinf=0, neginf=0)
         X_test_s = np.nan_to_num(X_test_s, nan=0, posinf=0, neginf=0)
+        
+        # Check for zero-variance columns and remove them
+        var = np.var(X_train_s, axis=0)
+        valid_cols = var > 1e-10
+        if valid_cols.sum() == 0:
+            print(f"    Warning: All features have zero variance!")
+            return {k: None for k in k_values}
+        
+        X_train_s = X_train_s[:, valid_cols]
+        X_test_s = X_test_s[:, valid_cols]
         
         results = {}
         max_k = min(X_train_s.shape[1], X_train_s.shape[0] - 1, max(k_values))
