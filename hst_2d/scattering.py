@@ -1,73 +1,89 @@
 """
 2D Heisenberg Scattering Transform - Core Implementation
 
-This is the key file that implements Glinsky's HST in 2D:
-- Uses wavelet cascade like Mallat/Kymatio
-- Replaces modulus with Glinsky's R = i*ln(R0) rectifier  
-- Maintains complex data flow throughout (not real like standard scattering)
+This implements Glinsky's HST as a proper wavelet scattering cascade:
+    signal → [wavelet convolution → R rectifier]^n → lowpass average
 
-Key difference from Kymatio:
-    Kymatio: signal → wavelet → |·| (modulus) → wavelet → |·| → average
-    HST:     signal → wavelet → R(·) (complex) → wavelet → R(·) → average
-    
-The R rectifier preserves phase information that modulus discards.
+Key features:
+1. Two-channel (H+/H-) Paul wavelets for full Fourier plane coverage
+2. Glinsky's R = i·ln(R₀) rectifier preserving complex/phase information
+3. Complex data flow throughout (no Hermitian symmetry assumptions)
+4. Littlewood-Paley normalized filter bank
+
+Architecture:
+    Order 0: S₀ = x * φ  (lowpass average)
+    Order 1: S₁ = R(x * ψ_{j,θ,±}) * φ
+    Order 2: S₂ = R(R(x * ψ₁) * ψ₂) * φ
 """
 
-import torch
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+import torch
+from typing import Dict, List, Optional, Union, Tuple
+from dataclasses import dataclass
+
+from .filter_bank import create_filter_bank, verify_littlewood_paley
 
 
-def glinsky_R0(z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+# =============================================================================
+# Glinsky Rectifier Functions
+# =============================================================================
+
+def joukowsky_inverse_torch(w: torch.Tensor) -> torch.Tensor:
     """
-    Glinsky's R0 mapping using inverse Joukowsky transform.
+    Inverse Joukowsky transform: solve z² - 2wz + 1 = 0 for z.
     
-    R0(z) = -i * h^{-1}(2z/π)
-    
-    where h(z) = (z + 1/z) / 2 is the Joukowsky transform.
+    h(z) = (z + 1/z) / 2  →  h⁻¹(w) = w ± √(w² - 1)
+    Choose root closer to unit circle.
     """
-    w = 2.0 * z / np.pi
-    # h^{-1}(w): solve z^2 - 2wz + 1 = 0 → z = w ± sqrt(w^2 - 1)
     disc = torch.sqrt(w**2 - 1.0 + 0j)
     z1 = w + disc
     z2 = w - disc
-    # Choose root closer to unit circle
-    h_inv = torch.where(torch.abs(torch.abs(z1) - 1) < torch.abs(torch.abs(z2) - 1), z1, z2)
-    return -1j * h_inv
+    return torch.where(
+        torch.abs(torch.abs(z1) - 1) < torch.abs(torch.abs(z2) - 1),
+        z1, z2
+    )
 
 
-def glinsky_R(z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+def glinsky_R0_torch(z: torch.Tensor) -> torch.Tensor:
+    """
+    Glinsky's R₀ mapping.
+    
+    R₀(z) = -i · h⁻¹(2z/π)
+    """
+    return -1j * joukowsky_inverse_torch(2.0 * z / np.pi)
+
+
+def glinsky_R_torch(z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     Glinsky's full R rectifier.
     
-    R(z) = i * ln(R0(z))
+    R(z) = i · ln(R₀(z))
     
-    This is the nonlinearity that replaces modulus in the scattering cascade.
-    Unlike modulus which discards phase, R preserves it in a gauge-invariant way.
+    This maps complex → complex while preserving topological information.
+    Unlike modulus which discards phase, R encodes it in the real part.
     
-    Output: R(z) ≈ -arg(R0(z)) + i*ln|R0(z)|
+    R(z) ≈ -arg(R₀(z)) + i·ln|R₀(z)|
     """
-    R0_z = glinsky_R0(z, eps)
-    # Add small imaginary part for numerical stability of log
+    R0_z = glinsky_R0_torch(z)
     return 1j * torch.log(R0_z + eps * 1j)
 
 
-def simple_R(z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+def simple_R_torch(z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
-    Simplified R mapping (without Joukowsky).
+    Simplified R mapping (without Joukowsky transform).
     
-    R(z) = i * ln(z)
+    R(z) = i · ln(z)
     
-    Useful for testing. This is what Glinsky uses in the limit.
+    Useful for testing. This is what Glinsky's R approaches for small z.
     """
-    return 1j * torch.log(z + eps)
+    return 1j * torch.log(z + eps * (1 + 1j))
 
 
-def lift_radial(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def lift_radial_torch(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     Lift signal away from origin to avoid log singularity.
     
-    r̃ = sqrt(|z|² + eps²), angle unchanged
+    r̃ = √(|z|² + ε²), angle unchanged.
     """
     r = torch.abs(z)
     r_floor = torch.sqrt(r**2 + eps**2)
@@ -75,28 +91,44 @@ def lift_radial(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return z * scale
 
 
+# =============================================================================
+# HST2D Class
+# =============================================================================
+
+@dataclass
+class HST2DOutput:
+    """Container for HST2D output coefficients."""
+    S0: torch.Tensor  # Order 0 (lowpass)
+    S1: List[Dict]    # Order 1 coefficients with metadata
+    S2: List[Dict]    # Order 2 coefficients with metadata
+    info: Dict        # Transform metadata
+
+
 class HST2D:
     """
     2D Heisenberg Scattering Transform.
     
-    This implements Glinsky's HST using the Kymatio cascade structure:
-    
-    Order 0: S0 = x * phi  (lowpass average)
-    Order 1: U1 = x * psi_j,θ  → R(U1) → S1 = R(U1) * phi
-    Order 2: U2 = R(U1) * psi_j',θ' → R(U2) → S2 = R(U2) * phi
+    Implements Glinsky's HST using proper wavelet cascade with:
+    - Two-channel Paul wavelets (H+ and H-)
+    - Glinsky's R = i·ln(R₀) rectifier
+    - Full complex data flow
     
     Parameters
     ----------
     M, N : int
         Spatial dimensions of input
     J : int
-        Number of scales
-    L : int
+        Number of scales (octaves)
+    L : int  
         Number of orientations
     max_order : int
         Maximum scattering order (1 or 2)
     rectifier : str
-        'glinsky' for full R, 'simple' for i*ln(z), 'modulus' for |z|
+        'glinsky': Full R = i·ln(R₀) 
+        'simple': Simplified R = i·ln(z)
+        'modulus': Standard |z| (for comparison)
+    device : str or torch.device
+        Compute device ('cpu' or 'cuda')
     """
     
     def __init__(
@@ -107,7 +139,7 @@ class HST2D:
         L: int = 8,
         max_order: int = 2,
         rectifier: str = 'glinsky',
-        device: torch.device = None,
+        device: Union[str, torch.device] = 'cpu',
     ):
         self.M = M
         self.N = N
@@ -115,67 +147,56 @@ class HST2D:
         self.L = L
         self.max_order = max_order
         self.rectifier = rectifier
-        self.device = device or torch.device('cpu')
+        self.device = torch.device(device)
         
-        # Build filter bank
-        from hst_2d.filter_bank import filter_bank
-        self._filters_np = filter_bank(M, N, J, L)
+        # Build and normalize filter bank
+        self._build_filters()
         
-        # Convert to torch tensors
-        self.phi = self._convert_filter(self._filters_np['phi'])
-        self.psi = [self._convert_filter(p) for p in self._filters_np['psi']]
+    def _build_filters(self):
+        """Build two-channel Paul wavelet filter bank."""
+        # Create NumPy filter bank
+        filters_np = create_filter_bank(self.M, self.N, self.J, self.L, normalize=True)
         
-    def _convert_filter(self, filt_dict: dict) -> dict:
-        """Convert numpy filter dict to torch."""
-        result = {'j': filt_dict['j']}
-        if 'theta' in filt_dict:
-            result['theta'] = filt_dict['theta']
-        result['levels'] = [
-            torch.from_numpy(lvl.astype(np.complex128)).to(self.device)
-            for lvl in filt_dict['levels']
-        ]
-        return result
-    
+        # Verify Littlewood-Paley
+        lp_check = verify_littlewood_paley(filters_np)
+        self.littlewood_paley_info = lp_check
+        
+        # Convert to PyTorch tensors
+        self.psi = []
+        for psi_dict in filters_np['psi']:
+            self.psi.append({
+                'filter': torch.from_numpy(psi_dict['filter']).to(self.device),
+                'j': psi_dict['j'],
+                'theta': psi_dict['theta'],
+                'theta_rad': psi_dict['theta_rad'],
+                'channel': psi_dict['channel'],
+            })
+        
+        self.phi = {
+            'filter': torch.from_numpy(filters_np['phi']['filter']).to(self.device),
+            'j': filters_np['phi']['j'],
+        }
+        
+        self.filter_info = filters_np['info']
+        
     def _rectify(self, z: torch.Tensor) -> torch.Tensor:
-        """Apply rectifier based on setting."""
-        # Lift away from origin first
-        z_lifted = lift_radial(z)
+        """Apply the selected rectifier."""
+        # First lift away from origin
+        z_lifted = lift_radial_torch(z)
         
         if self.rectifier == 'glinsky':
-            return glinsky_R(z_lifted)
+            return glinsky_R_torch(z_lifted)
         elif self.rectifier == 'simple':
-            return simple_R(z_lifted)
+            return simple_R_torch(z_lifted)
         elif self.rectifier == 'modulus':
-            # Standard scattering - returns REAL
-            return torch.abs(z_lifted)
+            # Standard scattering - returns magnitude (but as complex for consistency)
+            return torch.abs(z_lifted).to(z.dtype)
         else:
             raise ValueError(f"Unknown rectifier: {self.rectifier}")
     
-    def _cdgmm(self, x: torch.Tensor, filt: torch.Tensor) -> torch.Tensor:
-        """Complex-domain element-wise multiplication."""
-        return x * filt
-    
-    def _subsample_fourier(self, x: torch.Tensor, k: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> HST2DOutput:
         """
-        Subsample in Fourier domain by factor k.
-        
-        Subsampling in space = periodization in Fourier.
-        """
-        if k == 1:
-            return x
-        
-        M, N = x.shape[-2:]
-        M_new, N_new = M // k, N // k
-        
-        # Reshape and average over k×k blocks
-        y = x.view(*x.shape[:-2], k, M_new, k, N_new)
-        y = y.mean(dim=(-4, -2))  # Average over the k dimensions
-        
-        return y
-    
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Compute 2D HST coefficients.
+        Compute 2D HST scattering coefficients.
         
         Parameters
         ----------
@@ -184,156 +205,270 @@ class HST2D:
             
         Returns
         -------
-        S : dict
-            'S0': Order 0 coefficients (lowpass)
-            'S1': Order 1 coefficients, list of dicts with 'coef', 'j', 'theta'
-            'S2': Order 2 coefficients, list of dicts with 'coef', 'j1', 'j2', etc.
+        output : HST2DOutput
+            S0: Order 0 coefficients
+            S1: List of order 1 coefficient dicts
+            S2: List of order 2 coefficient dicts
         """
-        # Ensure complex
+        # Ensure complex tensor on correct device
         if not x.is_complex():
             x = x.to(torch.complex128)
         x = x.to(self.device)
         
-        results = {'S0': [], 'S1': [], 'S2': []}
+        batch_shape = x.shape[:-2]
+        x = x.reshape(-1, self.M, self.N)
+        batch_size = x.shape[0]
+        
+        S1_list = []
+        S2_list = []
         
         # FFT of input
-        U_0_hat = torch.fft.fft2(x)
+        x_hat = torch.fft.fft2(x)
         
         # === Order 0: Lowpass average ===
-        S_0_hat = self._cdgmm(U_0_hat, self.phi['levels'][0])
-        S_0_hat = self._subsample_fourier(S_0_hat, 2**self.J)
-        S_0 = torch.fft.ifft2(S_0_hat)
-        results['S0'] = S_0
+        S0_hat = x_hat * self.phi['filter'].unsqueeze(0)
+        S0 = torch.fft.ifft2(S0_hat)
         
         if self.max_order < 1:
-            return results
+            return HST2DOutput(
+                S0=S0.reshape(batch_shape + (self.M, self.N)),
+                S1=S1_list,
+                S2=S2_list,
+                info={'J': self.J, 'L': self.L, 'rectifier': self.rectifier}
+            )
         
         # === Order 1: Wavelet → Rectify → Average ===
-        U1_rectified = {}  # Store for order 2
+        U1_dict = {}  # Store rectified signals for order 2
         
-        for n1, psi1 in enumerate(self.psi):
-            j1 = psi1['j']
-            theta1 = psi1['theta']
+        for idx, psi in enumerate(self.psi):
+            j1 = psi['j']
             
-            # Convolve with wavelet
-            U_1_hat = self._cdgmm(U_0_hat, psi1['levels'][0])
+            # Convolve with wavelet (in Fourier domain)
+            U1_hat = x_hat * psi['filter'].unsqueeze(0)
+            U1 = torch.fft.ifft2(U1_hat)
             
-            # Subsample in Fourier
-            if j1 > 0:
-                U_1_hat = self._subsample_fourier(U_1_hat, 2**j1)
-            
-            # Back to spatial domain
-            U_1 = torch.fft.ifft2(U_1_hat)
-            
-            # === KEY DIFFERENCE: Apply R instead of modulus ===
-            U_1_rect = self._rectify(U_1)
+            # Apply rectifier
+            U1_rect = self._rectify(U1)
             
             # Store for order 2
-            U1_rectified[n1] = U_1_rect
+            U1_dict[idx] = U1_rect
             
-            # Average with lowpass (use appropriate resolution level)
-            # For complex R output, we stay in complex domain
-            if self.rectifier == 'modulus':
-                # Standard scattering: modulus output is real, use rfft logic
-                U_1_rect_hat = torch.fft.fft2(U_1_rect.real.to(torch.complex128))
-            else:
-                # HST: R output is complex, use full fft
-                U_1_rect_hat = torch.fft.fft2(U_1_rect)
+            # Average with lowpass
+            U1_rect_hat = torch.fft.fft2(U1_rect)
+            S1_hat = U1_rect_hat * self.phi['filter'].unsqueeze(0)
+            S1 = torch.fft.ifft2(S1_hat)
             
-            S_1_hat = self._cdgmm(U_1_rect_hat, self.phi['levels'][min(j1, len(self.phi['levels'])-1)])
-            S_1_hat = self._subsample_fourier(S_1_hat, 2**(self.J - j1))
-            S_1 = torch.fft.ifft2(S_1_hat)
-            
-            results['S1'].append({
-                'coef': S_1,
+            S1_list.append({
+                'coef': S1,
                 'j': j1,
-                'theta': theta1,
-                'n': n1,
+                'theta': psi['theta'],
+                'channel': psi['channel'],
+                'idx': idx,
             })
         
         if self.max_order < 2:
-            return results
+            # Reshape outputs
+            for item in S1_list:
+                item['coef'] = item['coef'].reshape(batch_shape + (self.M, self.N))
+            
+            return HST2DOutput(
+                S0=S0.reshape(batch_shape + (self.M, self.N)),
+                S1=S1_list,
+                S2=S2_list,
+                info={'J': self.J, 'L': self.L, 'rectifier': self.rectifier}
+            )
         
-        # === Order 2: Second wavelet → Rectify → Average ===
-        for n1, psi1 in enumerate(self.psi):
+        # === Order 2: Second cascade ===
+        for idx1, psi1 in enumerate(self.psi):
             j1 = psi1['j']
-            theta1 = psi1['theta']
+            U1_rect = U1_dict[idx1]
+            U1_rect_hat = torch.fft.fft2(U1_rect)
             
-            U_1_rect = U1_rectified[n1]
-            
-            # FFT of rectified signal
-            if self.rectifier == 'modulus':
-                U_1_rect_hat = torch.fft.fft2(U_1_rect.real.to(torch.complex128))
-            else:
-                U_1_rect_hat = torch.fft.fft2(U_1_rect)
-            
-            for n2, psi2 in enumerate(self.psi):
+            for idx2, psi2 in enumerate(self.psi):
                 j2 = psi2['j']
-                theta2 = psi2['theta']
                 
-                # Frequency ordering constraint: j2 > j1
+                # Frequency ordering: j2 > j1 (second wavelet at coarser scale)
                 if j2 <= j1:
                     continue
                 
                 # Convolve with second wavelet
-                # Use appropriate resolution level
-                level_idx = min(j1, len(psi2['levels']) - 1)
-                U_2_hat = self._cdgmm(U_1_rect_hat, psi2['levels'][level_idx])
-                U_2_hat = self._subsample_fourier(U_2_hat, 2**(j2 - j1))
+                U2_hat = U1_rect_hat * psi2['filter'].unsqueeze(0)
+                U2 = torch.fft.ifft2(U2_hat)
                 
-                # Back to spatial
-                U_2 = torch.fft.ifft2(U_2_hat)
+                # Apply rectifier
+                U2_rect = self._rectify(U2)
                 
-                # Rectify
-                U_2_rect = self._rectify(U_2)
+                # Average with lowpass
+                U2_rect_hat = torch.fft.fft2(U2_rect)
+                S2_hat = U2_rect_hat * self.phi['filter'].unsqueeze(0)
+                S2 = torch.fft.ifft2(S2_hat)
                 
-                # Average
-                if self.rectifier == 'modulus':
-                    U_2_rect_hat = torch.fft.fft2(U_2_rect.real.to(torch.complex128))
-                else:
-                    U_2_rect_hat = torch.fft.fft2(U_2_rect)
-                
-                level_idx_phi = min(j2, len(self.phi['levels']) - 1)
-                S_2_hat = self._cdgmm(U_2_rect_hat, self.phi['levels'][level_idx_phi])
-                S_2_hat = self._subsample_fourier(S_2_hat, 2**(self.J - j2))
-                S_2 = torch.fft.ifft2(S_2_hat)
-                
-                results['S2'].append({
-                    'coef': S_2,
-                    'j1': j1,
-                    'j2': j2,
-                    'theta1': theta1,
-                    'theta2': theta2,
-                    'n1': n1,
-                    'n2': n2,
+                S2_list.append({
+                    'coef': S2,
+                    'j1': j1, 'j2': j2,
+                    'theta1': psi1['theta'], 'theta2': psi2['theta'],
+                    'channel1': psi1['channel'], 'channel2': psi2['channel'],
+                    'idx1': idx1, 'idx2': idx2,
                 })
         
-        return results
-    
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Extract flat feature vector from scattering coefficients.
+        # Reshape outputs
+        for item in S1_list:
+            item['coef'] = item['coef'].reshape(batch_shape + (self.M, self.N))
+        for item in S2_list:
+            item['coef'] = item['coef'].reshape(batch_shape + (self.M, self.N))
         
-        Concatenates |S0|, |S1|, |S2| into a single vector.
+        return HST2DOutput(
+            S0=S0.reshape(batch_shape + (self.M, self.N)),
+            S1=S1_list,
+            S2=S2_list,
+            info={'J': self.J, 'L': self.L, 'rectifier': self.rectifier,
+                  'n_S1': len(S1_list), 'n_S2': len(S2_list)}
+        )
+    
+    def extract_features(self, x: torch.Tensor) -> np.ndarray:
         """
-        S = self.forward(x)
+        Extract U(1)-INVARIANT feature vector from scattering coefficients.
+        
+        Key insight: Global phase rotation x → x·e^{iφ} should not change features.
+        
+        U(1)-invariant quantities:
+        - |c| (magnitude)
+        - c_a * conj(c_b) for different channels (phase cancels)
+        
+        For chirality detection, cross-channel terms H+ * conj(H-) are crucial:
+        these flip sign under conjugation (chirality flip) but are phase-invariant.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input field, shape (M, N) or (batch, M, N)
+            
+        Returns
+        -------
+        features : ndarray
+            U(1)-invariant feature vector
+        """
+        output = self.forward(x)
+        
+        features = []
+        
+        # S0 features - ONLY magnitude (S0 = lowpass of raw x, contains phase)
+        s0 = output.S0
+        features.append(torch.abs(s0).mean().item())
+        features.append(torch.abs(s0).std().item())
+        
+        # S1 features - magnitude only for individual coefficients
+        for s1 in output.S1:
+            c = s1['coef']
+            features.append(torch.abs(c).mean().item())
+        
+        # S1 cross-channel features (H+ * conj(H-)) - these detect chirality!
+        # Group S1 by (j, theta), then compute H+ * conj(H-)
+        s1_by_jt = {}
+        for s1 in output.S1:
+            key = (s1['j'], s1['theta'])
+            if key not in s1_by_jt:
+                s1_by_jt[key] = {}
+            s1_by_jt[key][s1['channel']] = s1['coef']
+        
+        for (j, theta), channels in s1_by_jt.items():
+            if 'H+' in channels and 'H-' in channels:
+                # Cross-term: H+ * conj(H-) is U(1)-invariant but chirality-sensitive
+                cross = channels['H+'] * torch.conj(channels['H-'])
+                # The REAL part is symmetric, IMAG part is antisymmetric under conjugation
+                features.append(torch.real(cross).mean().item())  # Symmetric
+                features.append(torch.imag(cross).mean().item())  # ANTISYMMETRIC - chirality!
+        
+        # S2 features - magnitude only
+        for s2 in output.S2:
+            c = s2['coef']
+            features.append(torch.abs(c).mean().item())
+        
+        # S2 cross-channel features (more complex but same principle)
+        # Group by (j1, j2, theta1, theta2) and look for channel pairs
+        s2_by_path = {}
+        for s2 in output.S2:
+            key = (s2['j1'], s2['j2'], s2['theta1'], s2['theta2'])
+            if key not in s2_by_path:
+                s2_by_path[key] = {}
+            ch_key = (s2['channel1'], s2['channel2'])
+            s2_by_path[key][ch_key] = s2['coef']
+        
+        for path_key, channels in s2_by_path.items():
+            # Look for complementary channel pairs
+            for (ch1a, ch2a), coef_a in channels.items():
+                for (ch1b, ch2b), coef_b in channels.items():
+                    if (ch1a, ch2a) < (ch1b, ch2b):  # Avoid duplicates
+                        cross = coef_a * torch.conj(coef_b)
+                        features.append(torch.real(cross).mean().item())
+                        features.append(torch.imag(cross).mean().item())
+        
+        return np.array(features)
+    
+    def extract_features_magnitude_only(self, x: torch.Tensor) -> np.ndarray:
+        """
+        Extract ONLY magnitude features (simplest U(1)-invariant, but may lose chirality).
+        
+        Use this as a baseline to verify U(1) invariance is working.
+        """
+        output = self.forward(x)
         
         features = []
         
         # S0
-        features.append(torch.abs(S['S0']).flatten())
+        features.append(torch.abs(output.S0).mean().item())
         
         # S1
-        for s1 in S['S1']:
-            features.append(torch.abs(s1['coef']).flatten())
+        for s1 in output.S1:
+            features.append(torch.abs(s1['coef']).mean().item())
         
         # S2
-        for s2 in S['S2']:
-            features.append(torch.abs(s2['coef']).flatten())
+        for s2 in output.S2:
+            features.append(torch.abs(s2['coef']).mean().item())
         
-        return torch.cat(features)
+        return np.array(features)
+    
+    def __repr__(self) -> str:
+        return (f"HST2D(M={self.M}, N={self.N}, J={self.J}, L={self.L}, "
+                f"max_order={self.max_order}, rectifier='{self.rectifier}', "
+                f"n_wavelets={len(self.psi)})")
 
 
-def create_hst_2d(M, N, J=4, L=8, max_order=2, rectifier='glinsky', device=None):
-    """Factory function to create HST2D instance."""
-    return HST2D(M, N, J=J, L=L, max_order=max_order, rectifier=rectifier, device=device)
+# =============================================================================
+# Convenience factory function
+# =============================================================================
+
+def create_hst_2d(
+    M: int,
+    N: int,
+    J: int = 4,
+    L: int = 8,
+    max_order: int = 2,
+    rectifier: str = 'glinsky',
+    device: str = 'cpu',
+) -> HST2D:
+    """
+    Create HST2D instance.
+    
+    Parameters
+    ----------
+    M, N : int
+        Spatial dimensions
+    J : int
+        Number of scales
+    L : int
+        Number of orientations  
+    max_order : int
+        Maximum scattering order
+    rectifier : str
+        'glinsky', 'simple', or 'modulus'
+    device : str
+        'cpu' or 'cuda'
+        
+    Returns
+    -------
+    hst : HST2D
+        Configured HST instance
+    """
+    return HST2D(M, N, J=J, L=L, max_order=max_order, 
+                 rectifier=rectifier, device=device)

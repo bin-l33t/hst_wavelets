@@ -1,110 +1,154 @@
 """
 2D Filter Bank for Heisenberg Scattering Transform
 
-Based on Kymatio's filter_bank.py but adapted for HST.
-Uses Morlet wavelets initially (can be swapped to Cauchy/Paul).
+Two-channel design (H+ and H-) for complex signals, analogous to 1D HST.
+
+Key differences from standard (Kymatio-style) scattering filter banks:
+1. Uses Paul/Cauchy wavelets instead of Morlet (analytic, one-sided in freq)
+2. Two channels: H+ (positive freq half-plane) and H- (negative freq half-plane)
+3. Covers full [0, 2π) orientations, not just [0, π)
+4. Designed for complex input signals where Hermitian symmetry doesn't hold
+
+The two-channel design ensures we capture all information from complex
+intermediate signals after applying Glinsky's R rectifier.
 """
 
 import numpy as np
-from scipy.fft import fft2
+from typing import Dict, List, Tuple
 
 
-def gabor_2d(M, N, sigma, theta, xi, slant=1.0, offset=0):
+def paul_wavelet_2d_fourier(
+    M: int, 
+    N: int, 
+    j: int, 
+    theta: float, 
+    m: int = 4,
+    positive: bool = True,
+) -> np.ndarray:
     """
-    Computes a 2D Gabor filter in spatial domain.
+    Create 2D Paul wavelet in Fourier domain.
     
-    psi(u) = g_{sigma}(u) * exp(i * xi^T * u)
+    Paul wavelets are analytic (one-sided in frequency). In 2D, we create
+    a directional wavelet supported on a cone in the frequency half-plane
+    defined by the orientation theta.
     
     Parameters
     ----------
     M, N : int
-        Spatial sizes
-    sigma : float
-        Bandwidth parameter (scale)
+        Spatial dimensions
+    j : int
+        Scale index (larger j = coarser scale = lower frequency)
     theta : float
-        Orientation angle in [0, pi]
-    xi : float
-        Central frequency
-    slant : float
-        Ellipticity parameter
+        Orientation angle in [0, 2π)
+    m : int
+        Paul wavelet order (higher = more oscillations)
+    positive : bool
+        If True, H+ channel (positive freq cone along theta)
+        If False, H- channel (negative freq cone, opposite direction)
+        
+    Returns
+    -------
+    psi_hat : ndarray, shape (M, N), complex
+        Wavelet in Fourier domain
     """
-    gab = np.zeros((M, N), np.complex128)
+    # Frequency grid (centered at DC)
+    kx = np.fft.fftfreq(N)  # Normalized frequencies in [-0.5, 0.5)
+    ky = np.fft.fftfreq(M)
+    KX, KY = np.meshgrid(kx, ky)
     
-    # Rotation matrices
-    R = np.array([[np.cos(theta), -np.sin(theta)], 
-                  [np.sin(theta), np.cos(theta)]], np.float64)
-    R_inv = np.array([[np.cos(theta), np.sin(theta)], 
-                      [-np.sin(theta), np.cos(theta)]], np.float64)
-    D = np.array([[1, 0], [0, slant * slant]])
-    curv = np.dot(R, np.dot(D, R_inv)) / (2 * sigma * sigma)
+    # Rotate frequency coordinates to align with theta
+    # k_parallel: component along theta direction
+    # k_perp: component perpendicular to theta
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    k_parallel = KX * cos_t + KY * sin_t
+    k_perp = -KX * sin_t + KY * cos_t
     
-    # Sum over periodic copies for proper tiling
-    for ex in [-2, -1, 0, 1, 2]:
-        for ey in [-2, -1, 0, 1, 2]:
-            [xx, yy] = np.mgrid[offset + ex * M:offset + M + ex * M, 
-                                offset + ey * N:offset + N + ey * N]
-            arg = -(curv[0, 0] * xx * xx + 
-                   (curv[0, 1] + curv[1, 0]) * xx * yy + 
-                   curv[1, 1] * yy * yy) + \
-                  1j * (xx * xi * np.cos(theta) + yy * xi * np.sin(theta))
-            gab += np.exp(arg)
+    # For H- channel, flip the direction
+    if not positive:
+        k_parallel = -k_parallel
     
-    norm_factor = 2 * np.pi * sigma * sigma / slant
-    gab /= norm_factor
+    # Scale parameter: peak frequency decreases with j
+    # At j=0, peak near Nyquist; at j=J-1, peak near DC
+    k0 = 0.4 * (2.0 ** (-j))  # Central frequency for this scale
+    sigma = k0 / m  # Bandwidth (narrower for higher m)
     
-    return gab
+    # Paul wavelet in frequency domain:
+    # Supported only on k_parallel > 0 (one-sided / analytic)
+    # Shape: (k_parallel)^m * exp(-k_parallel / sigma) for k_parallel > 0
+    
+    # Radial distance from origin
+    k_norm = np.sqrt(KX**2 + KY**2)
+    
+    # Cone mask: only positive k_parallel (with soft edge)
+    # Using sigmoid for smooth transition
+    cone_width = 0.5  # Angular width parameter
+    cone_mask = 0.5 * (1 + np.tanh(k_parallel / (sigma * cone_width)))
+    
+    # Paul envelope along the radial direction
+    # Peaked at k0, decaying for larger/smaller k
+    # Using log-normal-like shape centered at k0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Avoid log(0)
+        log_k = np.where(k_norm > 1e-10, np.log(k_norm / k0), -100)
+        radial_envelope = np.exp(-0.5 * (log_k / (0.5))**2)
+        radial_envelope = np.where(k_norm > 1e-10, radial_envelope, 0)
+    
+    # Angular selectivity (Gaussian in perpendicular direction)
+    angular_envelope = np.exp(-0.5 * (k_perp / sigma)**2)
+    
+    # Combine: cone * radial * angular
+    psi_hat = cone_mask * radial_envelope * angular_envelope
+    
+    # Normalize to unit energy
+    energy = np.sum(np.abs(psi_hat)**2)
+    if energy > 1e-10:
+        psi_hat = psi_hat / np.sqrt(energy)
+    
+    return psi_hat.astype(np.complex128)
 
 
-def morlet_2d(M, N, sigma, theta, xi, slant=0.5, offset=0):
+def gaussian_lowpass_2d_fourier(M: int, N: int, sigma: float) -> np.ndarray:
     """
-    Computes a 2D Morlet filter (Gabor with zero-mean correction).
+    Create isotropic Gaussian lowpass filter in Fourier domain.
     
-    psi(u) = g_{sigma}(u) * (exp(i*xi^T*u) - beta)
-    
-    The beta term ensures zero mean (admissibility condition).
+    Parameters
+    ----------
+    M, N : int
+        Spatial dimensions
+    sigma : float
+        Cutoff frequency (larger = more lowpass)
+        
+    Returns
+    -------
+    phi_hat : ndarray, shape (M, N), real
+        Lowpass filter in Fourier domain
     """
-    wv = gabor_2d(M, N, sigma, theta, xi, slant, offset)
-    wv_modulus = gabor_2d(M, N, sigma, theta, 0, slant, offset)
-    K = np.sum(wv) / np.sum(wv_modulus)
+    kx = np.fft.fftfreq(N)
+    ky = np.fft.fftfreq(M)
+    KX, KY = np.meshgrid(kx, ky)
+    k_norm_sq = KX**2 + KY**2
     
-    mor = wv - K * wv_modulus
-    return mor
+    phi_hat = np.exp(-k_norm_sq / (2 * sigma**2))
+    
+    # Normalize
+    phi_hat = phi_hat / np.sqrt(np.sum(phi_hat**2))
+    
+    return phi_hat.astype(np.complex128)
 
 
-def periodize_filter_fft(x, res):
+def filter_bank_2d(
+    M: int, 
+    N: int, 
+    J: int = 4, 
+    L: int = 8,
+    m: int = 4,
+) -> Dict:
     """
-    Periodize filter in Fourier domain for subsampling.
+    Build 2D two-channel Paul wavelet filter bank for HST.
     
-    Cropping in Fourier = periodization in space.
-    """
-    M, N = x.shape
-    crop = np.zeros((M // 2**res, N // 2**res), x.dtype)
-    
-    # Mask to avoid aliasing
-    mask = np.ones(x.shape, np.float64)
-    len_x = int(M * (1 - 2**(-res)))
-    start_x = int(M * 2**(-res - 1))
-    len_y = int(N * (1 - 2**(-res)))
-    start_y = int(N * 2**(-res - 1))
-    mask[start_x:start_x + len_x, :] = 0
-    mask[:, start_y:start_y + len_y] = 0
-    x = x * mask
-    
-    # Periodize by summing shifted copies
-    M_crop = M // 2**res
-    N_crop = N // 2**res
-    for k in range(M_crop):
-        for l in range(N_crop):
-            for i in range(2**res):
-                for j in range(2**res):
-                    crop[k, l] += x[k + i * M_crop, l + j * N_crop]
-    
-    return crop
-
-
-def filter_bank(M, N, J, L=8):
-    """
-    Build 2D Morlet filter bank for scattering transform.
+    Creates wavelets at J scales and L orientations, with both H+ and H-
+    channels at each (j, theta) pair. This ensures full coverage of the
+    Fourier plane for complex signals.
     
     Parameters
     ----------
@@ -113,51 +157,211 @@ def filter_bank(M, N, J, L=8):
     J : int
         Number of scales (octaves)
     L : int
-        Number of orientations (angles)
+        Number of orientations per half-plane
+        Total orientations = L (covering [0, 2π) with both H+ and H-)
+    m : int
+        Paul wavelet order
         
     Returns
     -------
     filters : dict
-        'psi': list of wavelet dicts with 'levels', 'j', 'theta'
-        'phi': lowpass filter dict with 'levels', 'j'
+        'psi': list of wavelet dicts, each with:
+            'filter': ndarray (M, N) - wavelet in Fourier domain
+            'j': int - scale index
+            'theta': int - orientation index
+            'channel': str - 'H+' or 'H-'
+        'phi': dict with:
+            'filter': ndarray (M, N) - lowpass in Fourier domain
+            'j': int - J (coarsest scale)
+        'info': dict with metadata
     """
-    filters = {'psi': []}
+    filters = {
+        'psi': [],
+        'phi': None,
+        'info': {
+            'M': M, 'N': N, 'J': J, 'L': L, 'm': m,
+            'n_wavelets': 0,
+            'design': 'two_channel_paul',
+        }
+    }
     
-    # Mother wavelets at each scale and orientation
+    # Mother wavelets: J scales × L orientations × 2 channels
     for j in range(J):
         for theta_idx in range(L):
-            psi = {'levels': [], 'j': j, 'theta': theta_idx}
+            # Orientation angle covering [0, 2π)
+            theta = 2 * np.pi * theta_idx / L
             
-            # Kymatio's parameter choices
-            sigma = 0.8 * 2**j
-            theta = (int(L - L/2 - 1) - theta_idx) * np.pi / L
-            xi = 3.0 / 4.0 * np.pi / 2**j
-            slant = 4.0 / L
+            # H+ channel (positive frequency cone)
+            psi_plus = paul_wavelet_2d_fourier(M, N, j, theta, m, positive=True)
+            filters['psi'].append({
+                'filter': psi_plus,
+                'j': j,
+                'theta': theta_idx,
+                'theta_rad': theta,
+                'channel': 'H+',
+            })
             
-            # Generate in spatial domain, then FFT
-            psi_signal = morlet_2d(M, N, sigma, theta, xi, slant)
-            psi_signal_fourier = fft2(psi_signal)
-            
-            # Generate periodized versions for each resolution
-            psi_levels = []
-            for res in range(min(j + 1, max(J - 1, 1))):
-                psi_levels.append(periodize_filter_fft(psi_signal_fourier, res))
-            psi['levels'] = psi_levels
-            filters['psi'].append(psi)
+            # H- channel (negative frequency cone)
+            psi_minus = paul_wavelet_2d_fourier(M, N, j, theta, m, positive=False)
+            filters['psi'].append({
+                'filter': psi_minus,
+                'j': j,
+                'theta': theta_idx,
+                'theta_rad': theta,
+                'channel': 'H-',
+            })
     
-    # Father wavelet (lowpass) - just a Gaussian
-    phi_signal = gabor_2d(M, N, 0.8 * 2**(J-1), 0, 0)
-    phi_signal_fourier = fft2(phi_signal)
+    filters['info']['n_wavelets'] = len(filters['psi'])
     
-    filters['phi'] = {'levels': [], 'j': J}
-    for res in range(J):
-        filters['phi']['levels'].append(
-            periodize_filter_fft(phi_signal_fourier, res))
+    # Father wavelet (lowpass) - covers DC
+    sigma_phi = 0.05 * (2 ** J)  # Cutoff decreases with J
+    phi = gaussian_lowpass_2d_fourier(M, N, sigma_phi)
+    filters['phi'] = {
+        'filter': phi,
+        'j': J,
+    }
     
     return filters
 
 
-def compute_padding(M, N, J):
+def verify_littlewood_paley(filters: Dict, tol: float = 0.1) -> Dict:
+    """
+    Verify Littlewood-Paley condition (partition of unity).
+    
+    For a proper tight frame: Σ|ψ_j,θ(k)|² + |φ(k)|² ≈ 1 for all k
+    
+    Parameters
+    ----------
+    filters : dict
+        Filter bank from filter_bank_2d()
+    tol : float
+        Tolerance for deviation from 1
+        
+    Returns
+    -------
+    result : dict
+        'sum_sq': ndarray - sum of squared magnitudes at each frequency
+        'min': float - minimum value
+        'max': float - maximum value  
+        'mean': float - mean value
+        'passed': bool - whether within tolerance
+    """
+    M = filters['info']['M']
+    N = filters['info']['N']
+    
+    # Sum |ψ|² over all wavelets
+    sum_sq = np.zeros((M, N), dtype=np.float64)
+    
+    for psi in filters['psi']:
+        sum_sq += np.abs(psi['filter'])**2
+    
+    # Add lowpass
+    sum_sq += np.abs(filters['phi']['filter'])**2
+    
+    result = {
+        'sum_sq': sum_sq,
+        'min': float(np.min(sum_sq)),
+        'max': float(np.max(sum_sq)),
+        'mean': float(np.mean(sum_sq)),
+        'std': float(np.std(sum_sq)),
+        'passed': bool(np.abs(sum_sq - 1.0).max() < tol),
+    }
+    
+    return result
+
+
+def normalize_filterbank_littlewood_paley(filters: Dict) -> Dict:
+    """
+    Normalize filter bank to satisfy Littlewood-Paley condition.
+    
+    Divides each filter by sqrt(sum_sq) so that Σ|ψ|² + |φ|² = 1.
+    
+    Parameters
+    ----------
+    filters : dict
+        Filter bank from filter_bank_2d()
+        
+    Returns
+    -------
+    filters_normalized : dict
+        Normalized filter bank
+    """
+    M = filters['info']['M']
+    N = filters['info']['N']
+    
+    # Compute current sum of squares
+    sum_sq = np.zeros((M, N), dtype=np.float64)
+    for psi in filters['psi']:
+        sum_sq += np.abs(psi['filter'])**2
+    sum_sq += np.abs(filters['phi']['filter'])**2
+    
+    # Normalization factor
+    norm_factor = np.sqrt(np.maximum(sum_sq, 1e-10))
+    
+    # Create normalized copy
+    filters_norm = {
+        'psi': [],
+        'phi': None,
+        'info': filters['info'].copy(),
+    }
+    filters_norm['info']['normalized'] = True
+    
+    for psi in filters['psi']:
+        filters_norm['psi'].append({
+            'filter': psi['filter'] / norm_factor,
+            'j': psi['j'],
+            'theta': psi['theta'],
+            'theta_rad': psi['theta_rad'],
+            'channel': psi['channel'],
+        })
+    
+    filters_norm['phi'] = {
+        'filter': filters['phi']['filter'] / norm_factor,
+        'j': filters['phi']['j'],
+    }
+    
+    return filters_norm
+
+
+# =============================================================================
+# Convenience functions
+# =============================================================================
+
+def create_filter_bank(
+    M: int, 
+    N: int, 
+    J: int = 4, 
+    L: int = 8,
+    normalize: bool = True,
+) -> Dict:
+    """
+    Create 2D HST filter bank with optional Littlewood-Paley normalization.
+    
+    Parameters
+    ----------
+    M, N : int
+        Spatial dimensions
+    J : int
+        Number of scales
+    L : int
+        Number of orientations
+    normalize : bool
+        If True, normalize to satisfy Littlewood-Paley
+        
+    Returns
+    -------
+    filters : dict
+        Filter bank ready for use
+    """
+    filters = filter_bank_2d(M, N, J, L)
+    
+    if normalize:
+        filters = normalize_filterbank_littlewood_paley(filters)
+    
+    return filters
+
+
+def compute_padding(M: int, N: int, J: int) -> Tuple[int, int]:
     """Compute padded size to avoid boundary effects."""
     M_padded = ((M + 2**J) // 2**J + 1) * 2**J
     N_padded = ((N + 2**J) // 2**J + 1) * 2**J
