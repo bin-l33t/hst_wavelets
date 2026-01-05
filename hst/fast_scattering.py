@@ -7,13 +7,28 @@ import numpy as np
 try:
     from .conformal import glinsky_R_torch
 except ImportError:
-    def glinsky_R_torch(z, eps=1.0): # CHANGED default eps to 1.0 for stability
-        # Fallback: R(z) = i * ln(z)
-        # We use eps=1.0 ("lifting") to ensure log(r) ~ 0 when r ~ 0
-        # This prevents energy explosion for small wavelet coefficients
-        r = torch.abs(z) + eps
+    def glinsky_R_torch(z, eps=1.0): 
+        # MODIFIED: Gated rectifier to suppress phase noise at low amplitude
+        # Without this, small noise |z|~0 has random phase theta ~ [-pi, pi]
+        # Energy(|z|~0) -> |theta|^2 ~ pi^2/3 (massive amplification)
+        # We gate by tanh(|z|) to ensure R(0) = 0
+        
+        r = torch.abs(z)
         theta = torch.angle(z)
-        return -theta + 1j * torch.log(r)
+        
+        # Base Glinsky map
+        # Lifted log: log(r + eps) -> log(1) = 0 when r=0, eps=1
+        log_r = torch.log(r + eps)
+        
+        # Combine: -theta + i*log_r
+        # The phase term -theta is the dangerous part for energy
+        val = -theta + 1j * log_r
+        
+        # Soft gate: suppress output when signal is weak
+        # This acts like a "mass gap" or noise gate
+        gate = torch.tanh(r * 2.0) 
+        
+        return val * gate
 
 class FastHST(nn.Module):
     """
@@ -30,7 +45,7 @@ class FastHST(nn.Module):
     def __init__(self, J=4, kernel_size=16, m=4, rectifier='glinsky'):
         super().__init__()
         # DEBUG PRINT TO VERIFY VERSION
-        print(f"DEBUG: FastHST initialized with J={J}, rectifier={rectifier} (Normalization Fixed)")
+        print(f"DEBUG: FastHST initialized with J={J}, rectifier={rectifier} (Gated + Normalized)")
         self.J = J
         self.rectifier = rectifier
         self.kernel_size = kernel_size
@@ -52,9 +67,7 @@ class FastHST(nn.Module):
         
         # Normalization for Decimated Transform (Parseval Frame)
         # In a decimated transform (downsample by 2), the filters must have norm 1/sqrt(2) 
-        # (approx) to conserve energy, because we are splitting the signal bandwidth.
-        # Classic orthogonal wavelets satisfy |H(w)|^2 + |G(w)|^2 = 2.
-        # Here we approximate by normalizing L2 norm to 1/sqrt(2).
+        # (approx) to conserve energy.
         
         # Normalize energy of psi
         psi = psi / torch.norm(psi) / np.sqrt(2) 
@@ -138,8 +151,7 @@ class FastHST(nn.Module):
             
             # 2. Rectify (Non-linearity)
             if self.rectifier == 'glinsky':
-                # Use default eps=1.0 defined in this file's glinsky_R_torch
-                w = glinsky_R_torch(u)
+                w = glinsky_R_torch(u, eps=1.0)
             else:
                 w = torch.abs(u).to(u.dtype) # Mallat mode
                 
