@@ -92,6 +92,8 @@ def run_xy_benchmark() -> dict:
         """
         Compute vortex density from complex field.
         Vortex = 2π winding around a plaquette.
+        
+        FIXED: Don't wrap the final circulation - that erases vortices!
         """
         L = z.shape[0]
         theta = np.angle(z)
@@ -100,11 +102,12 @@ def run_xy_benchmark() -> dict:
         def wrap(x):
             return np.mod(x + np.pi, 2*np.pi) - np.pi
         
-        # Circulation around each plaquette
+        # Edge phase differences (wrapped is correct here)
         d_right = wrap(np.roll(theta, -1, axis=1) - theta)
         d_down = wrap(np.roll(theta, -1, axis=0) - theta)
         
         # Plaquette circulation: Σ dθ around square
+        # DO NOT WRAP THIS - vortices have circulation ±2π
         circulation = (
             d_right + 
             np.roll(d_down, -1, axis=1) - 
@@ -112,9 +115,11 @@ def run_xy_benchmark() -> dict:
             d_down
         )
         
-        # Vortex density = |circulation| / 2π
-        vortex_density = np.abs(wrap(circulation)) / (2 * np.pi)
-        return np.mean(vortex_density)
+        # Vortex charge = circulation / 2π (should be integers ±1, 0)
+        vortex_charge = np.rint(circulation / (2 * np.pi))
+        
+        # Vortex density = mean |charge|
+        return np.mean(np.abs(vortex_charge))
     
     # ========================================
     # FEATURE EXTRACTORS
@@ -226,6 +231,8 @@ def run_xy_benchmark() -> dict:
         """
         Gauge-invariant holonomy/circulation features.
         These should be naturally invariant to global phase.
+        
+        FIXED: Use vortex charge (circulation/2π) not wrap(circulation)
         """
         N, L, _ = data.shape
         features = []
@@ -237,36 +244,42 @@ def run_xy_benchmark() -> dict:
             def wrap(x):
                 return np.mod(x + np.pi, 2*np.pi) - np.pi
             
-            # Phase gradients (gauge-covariant)
+            # Phase gradients (gauge-covariant, wrapped on edges)
             dx = wrap(np.roll(theta, -1, axis=1) - theta)
             dy = wrap(np.roll(theta, -1, axis=0) - theta)
             
-            # Plaquette circulation (gauge-invariant!)
-            circulation = wrap(
+            # Plaquette circulation (DO NOT WRAP - preserves vortices)
+            circulation = (
                 dx + 
                 np.roll(dy, -1, axis=1) - 
                 np.roll(dx, -1, axis=0) - 
                 dy
             )
             
-            # Features from circulation (gauge-invariant)
+            # Vortex charge = circulation / 2π (integers)
+            vortex_charge = np.rint(circulation / (2 * np.pi))
+            
+            # Features from vortex charge (gauge-invariant)
             feat = [
-                np.mean(np.abs(circulation)),
-                np.std(np.abs(circulation)),
-                np.mean(circulation**2),
-                np.sum(np.abs(circulation) > 0.5) / L**2,  # Vortex density proxy
+                # Vortex statistics
+                np.mean(np.abs(vortex_charge)),  # Vortex density
+                np.mean(vortex_charge**2),       # Second moment
+                np.sum(vortex_charge > 0.5) / L**2,   # Positive vortex density
+                np.sum(vortex_charge < -0.5) / L**2,  # Negative vortex density
+                np.mean(vortex_charge),          # Net vorticity (should be ~0)
                 
-                # Gradient magnitude features
+                # Gradient magnitude features (gauge-invariant)
                 np.mean(np.abs(dx)),
                 np.mean(np.abs(dy)),
                 np.std(dx),
                 np.std(dy),
+                np.mean(dx**2 + dy**2),  # "Energy" proxy
                 
-                # Correlations at different scales
-                np.mean(dx * np.roll(dx, 1, axis=1)),
-                np.mean(dy * np.roll(dy, 1, axis=0)),
-                np.mean(circulation * np.roll(circulation, 1, axis=0)),
-                np.mean(circulation * np.roll(circulation, 1, axis=1)),
+                # Vortex correlations
+                np.mean(vortex_charge * np.roll(vortex_charge, 1, axis=0)),
+                np.mean(vortex_charge * np.roll(vortex_charge, 1, axis=1)),
+                np.mean(vortex_charge * np.roll(vortex_charge, 2, axis=0)),
+                np.mean(vortex_charge * np.roll(vortex_charge, 2, axis=1)),
             ]
             
             features.append(feat)
